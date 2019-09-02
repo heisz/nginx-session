@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
    for (idx = 1; idx < argc; idx++) {
         if (strcmp(argv[idx], "-c") == 0) {
             if (idx >= (argc - 1)) {
-                fprintf(stderr, "Error: missing -c <file> argument");
+                (void) fprintf(stderr, "Error: missing -c <file> argument\n");
                 usage(1);
             }
             configFileName = argv[++idx];
@@ -165,7 +165,7 @@ int main(int argc, char **argv) {
             usage(0);
         } else if (strcmp(argv[idx], "-r") == 0) {
             if (idx >= (argc - 1)) {
-                fprintf(stderr, "Error: missing -r <dir> argument");
+                (void) fprintf(stderr, "Error: missing -r <dir> argument\n");
                 usage(1);
             }
             rootDir = argv[++idx];
