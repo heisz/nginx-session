@@ -30,5 +30,4 @@ manager_LDADD = -lpthread -lm
 manager_LDFLAGS = -static
 
 # Removes the automake/autoconf generated files for ultra-clean source tree
-MAINTAINERCLEANFILES = config.cache config.log config.status Makefile.in \
-                       aclocal.m4 configure libtool config.h.in
+MAINTAINERCLEANFILES = Makefile.in
