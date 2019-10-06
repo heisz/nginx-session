@@ -40,7 +40,6 @@ manager_SOURCES += ../toolkit/src/db/pgsql/dbfpgsql.c
 endif
 
 manager_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ -lpthread -lm
-manager_LDFLAGS = -static
 
 # Removes the automake/autoconf generated files for ultra-clean source tree
 MAINTAINERCLEANFILES = Makefile.in
