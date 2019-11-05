@@ -18,8 +18,8 @@ instances.
 
 ### Acknowledgements and Thanks
 
-<a href="https://saucelabs.com"><img height="70" src="https://www.heisz.org/images/saucepowered.svg" alt="Powered by SauceLabs"></a></br>
-Cross-browser Testing Platform and Open Source <3 Provided by [Sauce Labs](https://saucelabs.com).
+<a href="https://saucelabs.com"><img height="60" src="https://www.heisz.org/images/saucepowered.svg" alt="Powered by SauceLabs"></a></br>
+Cross-browser Testing Platform and Open Source :heart: Provided by [Sauce Labs](https://saucelabs.com).
 
 ### License
 
