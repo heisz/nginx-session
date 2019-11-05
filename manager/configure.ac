@@ -34,7 +34,8 @@ AC_CANONICAL_HOST
 
 # Standard subdirectory make and compilation tests
 AC_PROG_MAKE_SET
-AC_PROG_CC
+AM_PROG_CC_C_O
+# AC_PROG_CC
 
 ####### Part C - Target and Build Type Determination #######
 
@@ -72,8 +73,8 @@ if test -n "${MYSQL_CONFIG}"; then
     AC_SUBST(MYSQL_SRCDIR)
     AC_SUBST(MYSQL_INCLUDE)
     AC_SUBST(MYSQL_LIB)
-    AM_CONDITIONAL([INCLUDE_MYSQL_DRV], [test 1])
 fi
+AM_CONDITIONAL([INCLUDE_MYSQL_DRV], [ test -n "${MYSQL_CONFIG}" ])
 
 # Determine if PostgreSQL is available and provide associated definitions
 AC_CHECK_PROGS(PGSQL_CONFIG, pg_config)
@@ -88,8 +89,8 @@ if test -n "${MYSQL_CONFIG}"; then
     AC_SUBST(PGSQL_SRCDIR)
     AC_SUBST(PGSQL_INCLUDE)
     AC_SUBST(PGSQL_LIB)
-    AM_CONDITIONAL([INCLUDE_PGSQL_DRV], [test 1])
 fi
+AM_CONDITIONAL([INCLUDE_PGSQL_DRV], [ test -n "${PGSQL_CONFIG}" ])
 
 ####### Part E - System-Specific Headers/Libraries/Options #######
 
