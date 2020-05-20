@@ -1,7 +1,7 @@
 /*
- * Definitions of the nginx elements for the HTTP session management module.
+ * Definitions of the NGINX elements for the session management module.
  *
- * Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -23,13 +23,17 @@ typedef struct {
     /* The upstream reference used for the connection to the manager */
     ngx_http_upstream_conf_t manager;
 
+    /* The command byte for this location (driven by binding command) */
+    ngx_int_t sess_req;
+
     /* Tags/flags for session instance determination and passing */
     ngx_str_t cookie_id;
     ngx_flag_t oauth_enabled;
     ngx_str_t session_property;
 
-    /* Target redirect for session verified resource access */
-    ngx_str_t verify_redirect_target;
+    /* Target redirects for session-managed resource access */
+    ngx_str_t valid_redirect_target;
+    ngx_str_t invalid_redirect_target;
 } ngx_http_session_loc_conf_t;
 
 /* Associated context information for the upstream manager request handling */

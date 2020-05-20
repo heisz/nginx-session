@@ -1,7 +1,7 @@
 /**
  * Methods for handling the various requests to the session manager.
  * 
- * Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -222,7 +222,11 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
 
         /* Direct incoming requests appropriately */
         /* For now, just issue responses */
+*(conn->request.buffer + 2) = '0';
         switch (*(conn->request.buffer + 2)) {
+            case '0':
+                NGXMGR_IssueResponse(conn, NGXMGR_SESSION_INVALID, "", 0);
+                break;
             case 'a':
                 NGXMGR_IssueResponse(conn, NGXMGR_SESSION_CONTINUE, "", 0);
                 break;

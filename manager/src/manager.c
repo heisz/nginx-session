@@ -1,15 +1,17 @@
 /**
  * Primary nginx session management daemon entry point.
  * 
- * Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
 #include "stdconfig.h"
+#include <stddef.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ctype.h>
 #include "manager.h"
 #include "buffer.h"
 #include "json.h"
@@ -41,16 +43,46 @@ static void usage(int errorCode) {
 static void version() {
     (void) fprintf(stdout,
         "Nginx Session Manager Daemon - v0.1.0\n\n"
-        "Copyright (C) 2018-2019, J.M. Heisz.  All rights reserved.\n"
+        "Copyright (C) 2018-2020, J.M. Heisz.  All rights reserved.\n"
         "See the LICENSE file accompanying the distribution your rights to\n"
         "use this software.\n");
     exit(0);
 }
 
-/* For lack of a better location, capture configuration here */
-static char *configFileName = "./manager.cfg";
-static int svcBindPort = 5344;
-static char *svcBindAddr = NULL;
+/* For lack of a better location, capture global configuration here */
+#ifndef SYSCONF_DIR
+#define SYSCONF_DIR "."
+#endif
+static char *configFileName = SYSCONF_DIR "/ngxsessmgr.cfg";
+
+GlobalConfigType GlobalConfig = {
+   /* svcBindAddr = */ NULL /* any */,
+   /* svcBindService = */ NULL /* 5344 */,
+   /* initialServerPoolSize = */ 1024,
+   /* eventPollLimit = */ 1024,
+   0
+};
+
+enum ConfigBindType {
+    BIND_STR, BIND_INT, BIND_SIZE
+};
+
+static struct ConfigBindInfo {
+    char *nodeName;
+    enum ConfigBindType bindType;
+    uint32_t bindOffset;
+} cfgBindings[] = {
+    { "service.bindAddress", BIND_STR,
+      offsetof(GlobalConfigType, svcBindAddr) },
+    { "service.bindPort", BIND_STR,
+      offsetof(GlobalConfigType, svcBindService) },
+    { "eventloop.poolSize", BIND_SIZE,
+      offsetof(GlobalConfigType, initialServerPoolSize) },
+    { "eventloop.pollSize", BIND_INT,
+      offsetof(GlobalConfigType, eventPollLimit) }
+};
+
+#define CFG_SETTINGS (sizeof(cfgBindings) / sizeof(struct ConfigBindInfo))
 
 /* Utility method to validate config entries with type validation/logging */
 static WXJSONValue *configFindWithType(WXJSONValue *cfg, const char *name,
@@ -70,8 +102,9 @@ static WXJSONValue *configFindWithType(WXJSONValue *cfg, const char *name,
  */
 static void parseConfiguration() {
     WXJSONValue *config, *val;
+    int idx, fd, inQuote = 0;
     WXBuffer fileContent;
-    int fd;
+    char *ptr, *str;
 
     /* Load the contents of the specified filename */
     if ((fd = open(configFileName, O_RDONLY)) < 0) {
@@ -89,6 +122,31 @@ static void parseConfiguration() {
     }
     (void) close(fd); fd = -1;
 
+    /* Remove comments, outside of quoted material */
+    ptr = (char *) fileContent.buffer;
+    while (*ptr != '\0') {
+        if (inQuote != 0) {
+            if ((inQuote < 0) && (*ptr == '\'')) inQuote++;
+            else if ((inQuote > 0) && (*ptr == '"')) inQuote--;
+        } else {
+            if (*ptr == '\'') inQuote--;
+            else if (*ptr == '"') inQuote++;
+            else if (*ptr == '#') {
+                /* Chomp the comment but leave the newline for line counting */
+                str = strchr(ptr, '\n');
+                if (str == NULL) *ptr = '\0';
+                else (void) memmove(ptr, str, strlen(str) + 1);
+            }
+        }
+        ptr++;
+    }
+
+
+    /* Trim and exit on empty file (avoids parse error) */
+    ptr = (char *) fileContent.buffer;
+    while (isspace(*ptr)) ptr++;
+    if (*ptr == '\0') return;
+
     /* And parse it */
     if ((config = WXJSON_Decode((const char *) fileContent.buffer)) == NULL) {
         WXLog_Error("Failed to parse configuration data (mem error)");
@@ -103,34 +161,52 @@ static void parseConfiguration() {
     }
     WXBuffer_Destroy(&fileContent);
 
-    /* Loads of lookups and translations follow... */
-    val = configFindWithType(config, "bindPort", WXJSONVALUE_INT);
-    if (val != NULL) {
-        svcBindPort = val->value.ival;
-    }
-    if (svcBindAddr != NULL) WXFree(svcBindAddr);
-    val = configFindWithType(config, "bindAddress", WXJSONVALUE_STRING);
-    if (val != NULL) {
-        svcBindAddr = WXMalloc(strlen(val->value.sval) + 1);
-        if (svcBindAddr != NULL) {
-            (void) strcpy(svcBindAddr, val->value.sval);
+    /* Use the binding table, Luke! */
+    for (idx = 0; idx < CFG_SETTINGS; idx++) {
+        ptr = ((char *) &GlobalConfig) + cfgBindings[idx].bindOffset;
+
+        switch (cfgBindings[idx].bindType) {
+            case BIND_STR:
+                val = configFindWithType(config, cfgBindings[idx].nodeName,
+                                         WXJSONVALUE_STRING);
+                if (val != NULL) {
+                    if (*((char **) ptr) != NULL) WXFree(*((char **) ptr));
+                    *((char **) ptr) = WXMalloc(strlen(val->value.sval) + 1);
+                    if (*((char **) ptr) != NULL) {
+                        (void) strcpy(*((char **) ptr), val->value.sval);
+                    }
+                } else {
+                    *((char **) ptr) = NULL;
+                }
+                break;
+
+            case BIND_INT:
+                val = configFindWithType(config, cfgBindings[idx].nodeName,
+                                         WXJSONVALUE_INT);
+                if (val != NULL) {
+                    *((int *) ptr) = val->value.ival;
+                }
+                break;
+
+            case BIND_SIZE:
+                val = configFindWithType(config, cfgBindings[idx].nodeName,
+                                         WXJSONVALUE_INT);
+                if (val != NULL) {
+                    *((size_t *) ptr) = val->value.ival;
+                }
+                break;
         }
-    } else {
-        svcBindAddr = NULL;
     }
 
     WXJSON_Destroy(config);
 }
-
-/* Track for clean shutdown */
-static int shutdownRequested = 0;
 
 /* Handle signals according to daemon operations */
 void coreSignalHandler(int sig) {
     /* All good things must come to an end... */
     if ((sig == SIGINT) || (sig == SIGTERM)) {
         WXLog_Info("Nginx session manager process exiting...");
-        shutdownRequested = TRUE;
+        GlobalConfig.shutdownRequested = TRUE;
     }
 
     /* Reconfiguration signal... */
@@ -141,15 +217,15 @@ void coreSignalHandler(int sig) {
 }
 
 /* Just keep things tidy */
-static int processRequests(WXSocket srvrConnectHandle);
+static int processRequests(WXSocket svcConnectHandle);
 
 /**
  * Where all of the fun begins!
  */
 int main(int argc, char **argv) {
     int rc, idx, daemonMode = -1, cnt;
-    char *rootDir = NULL, svc[64];
-    WXSocket srvrConnectHandle;
+    char *rootDir = NULL, *svc;
+    WXSocket svcConnectHandle;
 
    /* Parse the command line arguments (most options come from config file) */
    for (idx = 1; idx < argc; idx++) {
@@ -197,25 +273,28 @@ int main(int argc, char **argv) {
                BUILDLABEL);
 
     /* Open the bind socket, must be exclusive access */
-    WXLog_Info("Listening on %s:%d for incoming requests",
-               ((svcBindAddr == NULL) ? "any" : svcBindAddr), svcBindPort);
-    (void) sprintf(svc, "%d", svcBindPort);
-    if (WXSocket_OpenTCPServer(svcBindAddr, svc,
-                               &srvrConnectHandle) != WXNRC_OK) {
+    svc = (GlobalConfig.svcBindService == NULL) ? "5344" :
+                                                  GlobalConfig.svcBindService;
+    WXLog_Info("Listening on %s:%s for incoming requests",
+               ((GlobalConfig.svcBindAddr == NULL) ? "any" :
+                                                     GlobalConfig.svcBindAddr),
+               svc);
+    if (WXSocket_OpenTCPServer(GlobalConfig.svcBindAddr, svc,
+                               &svcConnectHandle) != WXNRC_OK) {
         WXLog_Error("Failed to open primary bind socket: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
         exit(1);
     }
 
     /* Force connect socket to non-blocking to cleanly handle multi-connect */
-    if (WXSocket_SetNonBlockingState(srvrConnectHandle, TRUE) != WXNRC_OK) {
+    if (WXSocket_SetNonBlockingState(svcConnectHandle, TRUE) != WXNRC_OK) {
         WXLog_Error("Unable to unblock primary bind socket: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
         exit(1);
     }
 
     /* Hand off to the request handler, returns on exit */
-    rc = processRequests(srvrConnectHandle);
+    rc = processRequests(svcConnectHandle);
 
     /* All done, tidy up... */
     daemonStop();
@@ -259,11 +338,11 @@ void NGXMGR_UpdateEvents(NGXModuleConnection *conn, uint32_t events) {
  * Basically runs forever (or until signalled otherwise) waiting for requests
  * from the nginx module.
  *
- * @param srvrConnectHandle The bind socket handle established during process
+ * @param svcConnectHandle The bind socket handle established during process
  *                          startup (connections from the nginx module).
  */
-static int processRequests(WXSocket srvrConnectHandle) {
-    WXEvent *event, msgEvents[MAX_EVENTS];
+static int processRequests(WXSocket svcConnectHandle) {
+    WXEvent *event, *eventBuffer;
     WXEvent_UserData data;
     WXSocket acceptHandle;
     char acceptAddr[256];
@@ -271,23 +350,37 @@ static int processRequests(WXSocket srvrConnectHandle) {
     int rc;
 
     /* Create the primary event registry, register for binding */
-    if (WXEvent_CreateRegistry(1024, &evtRegistry) != WXNRC_OK) {
+    if (WXEvent_CreateRegistry(GlobalConfig.initialServerPoolSize,
+                               &evtRegistry) != WXNRC_OK) {
         WXLog_Error("Failed to create primary event registry: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
         return 1;
     }
     data.ptr = NULL;
-    if (WXEvent_RegisterEvent(evtRegistry, srvrConnectHandle,
+    if (WXEvent_RegisterEvent(evtRegistry, svcConnectHandle,
                               WXEVENT_IN, data) != WXNRC_OK) {
         WXLog_Error("Failed to register server bind socket for events: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
         return 1;
     }
 
+    /* Allocate the configured event processing buffer */
+    eventBuffer = (WXEvent *) WXMalloc(GlobalConfig.eventPollLimit *
+                                       sizeof(WXEvent));
+    if (eventBuffer == NULL)
+    {
+        WXLog_Error("Failed to allocate event processing buffer");
+        return 1;
+    }
+
     /* Process forever, or at least until a signal tells us to stop */
-    while (shutdownRequested == 0) {
+    WXLog_Info("Event loop starting, polling %lld slots, %lld pool size",
+               (long long int) GlobalConfig.eventPollLimit,
+               (long long int) GlobalConfig.initialServerPoolSize);
+    while (GlobalConfig.shutdownRequested == 0) {
         /* Wait for something to happen... */
-        evtCnt = WXEvent_Wait(evtRegistry, msgEvents, MAX_EVENTS, NULL);
+        evtCnt = WXEvent_Wait(evtRegistry, eventBuffer,
+                              GlobalConfig.eventPollLimit, NULL);
         if (evtCnt < 0) {
             WXLog_Error("Error in wait on event action (rc %d): %s",
                         (int) evtCnt,
@@ -299,11 +392,11 @@ static int processRequests(WXSocket srvrConnectHandle) {
         }
 
         /* What it's all about, process request instances */
-        for (idx = 0, event = msgEvents; idx < evtCnt; idx++, event++) {
+        for (idx = 0, event = eventBuffer; idx < evtCnt; idx++, event++) {
             /* Handle incoming connection establish actions */
             /* Note that this loops until accept times out, for multiples */
-            while (event->socketHandle == srvrConnectHandle) {
-                rc = WXSocket_Accept(srvrConnectHandle, &acceptHandle,
+            while (event->socketHandle == svcConnectHandle) {
+                rc = WXSocket_Accept(svcConnectHandle, &acceptHandle,
                                      acceptAddr, sizeof(acceptAddr));
                 if (rc == WXNRC_TIMEOUT) break;
                 if (rc != WXNRC_OK) {
@@ -317,7 +410,7 @@ static int processRequests(WXSocket srvrConnectHandle) {
                                               acceptAddr);
                 }
             }
-            if (event->socketHandle == srvrConnectHandle) continue;
+            if (event->socketHandle == svcConnectHandle) continue;
 
             /* Otherwise it's a transfer processing event */
             NGXMGR_ProcessEvent((NGXModuleConnection *) event->userData.ptr,

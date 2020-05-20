@@ -1,13 +1,13 @@
 #
 # Makefile instance for the nginx session management daemon.
 #
-# Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+# Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
 # See the LICENSE file accompanying the distribution your rights to use
 # this software.
 #
 
-# Just one outcome from this build
-bin_PROGRAMS = manager
+# Just one target for this build
+bin_PROGRAMS = ngxsessmgr
 
 # Related inclusion locations and other options
 AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
@@ -15,9 +15,10 @@ AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
               -I../toolkit/src/lang \
               -I../toolkit/src/network \
               -I../toolkit/src/utility \
-              @MYSQL_INCLUDE@ @PGSQL_INCLUDE@
+              @MYSQL_INCLUDE@ @PGSQL_INCLUDE@ \
+              -DSYSCONF_DIR='"$(sysconfdir)"'
 
-manager_SOURCES = manager.c requests.c \
+ngxsessmgr_SOURCES = manager.c requests.c \
                   ../toolkit/src/db/dbxf.c \
                   ../toolkit/src/lang/json.c \
                   ../toolkit/src/network/event.c \
@@ -32,14 +33,18 @@ manager_SOURCES = manager.c requests.c \
 
 # What a pain, can't do direct substitution in automake SOURCES
 if INCLUDE_MYSQL_DRV
-manager_SOURCES += ../toolkit/src/db/mysql/dbfmysql.c
+ngxsessmgr_SOURCES += ../toolkit/src/db/mysql/dbfmysql.c
 endif
 
 if INCLUDE_PGSQL_DRV
-manager_SOURCES += ../toolkit/src/db/pgsql/dbfpgsql.c
+ngxsessmgr_SOURCES += ../toolkit/src/db/pgsql/dbfpgsql.c
 endif
 
-manager_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ -lpthread -lm
+ngxsessmgr_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ -lpthread -lm
+
+# Clone the example configuration file
+ngxsessmgr_confdir = $(sysconfdir)
+ngxsessmgr_conf_DATA = ../ngxsessmgr.cfg
 
 # Removes the automake/autoconf generated files for ultra-clean source tree
 MAINTAINERCLEANFILES = Makefile.in

@@ -1,7 +1,7 @@
 #
 # Autoconf macro definitions for the session manager server.
 #
-# Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+# Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
 # See the LICENSE file accompanying the distribution your rights to use
 # this software.
 #
@@ -20,11 +20,6 @@ AM_CONFIG_HEADER(config.h)
 # Uses libtool notation for sub-library compilation
 AM_PROG_AR
 LT_INIT
-
-# Choose a working default prefix
-dtag=`date "+%y%m%d%H%M%S"`
-ac_default_prefix="/tmp/wrdg-tk-${dtag}"
-year=`date "+%G"`
 
 # Configure the automake system and target host instance
 AM_INIT_AUTOMAKE([-Wall foreign subdir-objects])
@@ -64,6 +59,7 @@ AC_ARG_WITH(label,
 # Determine if MySQL is available and provide associated definitions
 AC_CHECK_PROGS(MYSQL_CONFIG, mysql_config)
 if test -n "${MYSQL_CONFIG}"; then
+    AC_MSG_NOTICE([Found MySQL/MariaDB client support, linking])
     AC_DEFINE([HAVE_MYSQL_DB], [1],
               [Define to 1 if you have build support for MySQL client])
     MYSQL_SRCDIR="mysql"
@@ -78,7 +74,8 @@ AM_CONDITIONAL([INCLUDE_MYSQL_DRV], [ test -n "${MYSQL_CONFIG}" ])
 
 # Determine if PostgreSQL is available and provide associated definitions
 AC_CHECK_PROGS(PGSQL_CONFIG, pg_config)
-if test -n "${MYSQL_CONFIG}"; then
+if test -n "${PGSQL_CONFIG}"; then
+    AC_MSG_NOTICE([Found PostgreSQL client support, linking])
     AC_DEFINE([HAVE_PGSQL_DB], [1],
               [Define to 1 if you have build support for PostgreSQL client])
     PGSQL_SRCDIR="pgsql"

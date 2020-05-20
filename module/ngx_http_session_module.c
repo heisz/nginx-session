@@ -1,7 +1,7 @@
 /*
- * Primary module engine entry point for the HTTP session management module.
+ * Primary module engine entry point for the NGINX session management module.
  *
- * Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -12,6 +12,8 @@
 #include "messages.h"
 
 /* Forward declaration of the segregated request handlers */
+static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
+                                       void *conf);
 static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
                                      void *conf);
 static char *ngx_http_session_status(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -66,6 +68,12 @@ static ngx_command_t ngx_http_session_commands[] = {
       NULL },
 
     /* Enablement for session-protected resource access (location only) */
+    { ngx_string("session_redirect"),
+      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE2 | NGX_CONF_TAKE3,
+      ngx_http_session_redirect,
+      NGX_HTTP_LOC_CONF_OFFSET, 
+      0, NULL},
+
     { ngx_string("session_verify"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE2,
       ngx_http_session_verify,
@@ -99,6 +107,7 @@ static ngx_command_t ngx_http_session_commands[] = {
       ngx_http_session_status,
       NGX_HTTP_LOC_CONF_OFFSET, 
       0, NULL},
+
     ngx_null_command
 };
 
@@ -152,10 +161,20 @@ static void *ngx_http_session_create_loc_conf(ngx_conf_t *cf) {
     // conf->cookie_id = { 0, NULL };
     conf->oauth_enabled = NGX_CONF_UNSET;
     // conf->session_property = { 0, NULL };
-    // conf->verify_redirect_target = { 0, NULL };
+    // conf->valid_redirect_target = { 0, NULL };
+    // conf->invalid_redirect_target = { 0, NULL };
 
     return conf;
 }
+
+/* Odd case, no way to merge strings with NULL using standard ngx defines */
+#define ngx_conf_merge_str(conf, prev)             \
+    if (conf.data == NULL) {                       \
+        if (prev.data != NULL) {                   \
+            conf.len = prev.len;                   \
+            conf.data = prev.data;                 \
+        }                                          \
+    }
 
 /**
  * Matching method to merge between multiple location definitions, apparently
@@ -208,8 +227,10 @@ static char *ngx_http_session_merge_loc_conf(ngx_conf_t *cf,
     ngx_conf_merge_value(conf->oauth_enabled, prev->oauth_enabled, NGX_FALSE);
     ngx_conf_merge_str_value(conf->session_property,
                              prev->session_property, "sid");
-    ngx_conf_merge_str_value(conf->verify_redirect_target,
-                             prev->verify_redirect_target, NULL);
+    ngx_conf_merge_str(conf->valid_redirect_target,
+                       prev->valid_redirect_target);
+    ngx_conf_merge_str(conf->invalid_redirect_target,
+                       prev->invalid_redirect_target);
 
     return NGX_CONF_OK;
 }
@@ -271,13 +292,13 @@ static const char *get_method_name(ngx_int_t method) {
 }
 
 /**
- * Request handler for session_verify bound request handling, verifying session
- * information and then redirecting appropriately.
+ * Request handler for session redirect/verify bound request handling, pulling
+ * and verifying session information and then redirecting appropriately.
  *
  * @param req Reference to the associated incoming HTTP request instance.
  * @return Suitable status return based on processing.
  */
-static ngx_int_t ngx_http_session_verify_handler(ngx_http_request_t *req) {
+static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     ngx_http_session_loc_conf_t *slcf;
     ngx_http_session_request_ctx_t *ctx;
     ngx_int_t rc, la, lb, lc;
@@ -319,7 +340,7 @@ static ngx_int_t ngx_http_session_verify_handler(ngx_http_request_t *req) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     *((uint32_t *) ptr) = htonl(ctx->request_length - 4);
-    *ptr = NGXMGR_VERIFY_SESSION; ptr += 4;
+    *ptr = (uint8_t) slcf->sess_req; ptr += 4;
 
     *((uint16_t *) ptr) = htons(la); ptr += 2;
     ngx_memcpy(ptr, session_id.data, la); ptr += la;
@@ -344,8 +365,8 @@ static ngx_int_t ngx_http_session_verify_handler(ngx_http_request_t *req) {
 }
 
 /**
- * Parsing method for the primary session_verify directive.  Registers/binds to
- * the upstream instance and registers the session validation handler for
+ * Parsing method for the session_redirect directive.  Registers/binds to
+ * the upstream instance and registers the session request handler for
  * incoming requests to this location.
  *
  * @param cf The module/location configuration instance reference.
@@ -353,15 +374,15 @@ static ngx_int_t ngx_http_session_verify_handler(ngx_http_request_t *req) {
  * @param conf Configuration content for the module instance.
  * @return Status result for the configuration parsing/setup.
  */
-static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
-                                     void *conf) {
+static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
+                                       void *conf) {
     ngx_http_session_loc_conf_t *slcf = conf;
     ngx_str_t *values = (ngx_str_t *) cf->args->elts;
     ngx_http_core_loc_conf_t *clcf;
     ngx_url_t url;
 
     ngx_log_debug4(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                   "*** session manager: enabled for %.*s [to %.*s]",
+                   "*** session manager: redirect for %.*s [to %.*s]",
                    values[1].len, values[1].data,
                    values[2].len, values[2].data);
 
@@ -380,12 +401,70 @@ static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
 
+    /* Underlying command for the request handler */
+    slcf->sess_req = NGXMGR_VALIDATE_SESSION;
+
     /* Store the verified redirect target - @ or get */
-    slcf->verify_redirect_target = values[2];
+    slcf->valid_redirect_target = values[2];
+
+    /* Optionally, store the failure target (error in response if undefined) */
+    if (cf->args->nelts > 3) {
+        slcf->invalid_redirect_target = values[3];
+    }
 
     /* Insert the request handler */
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-    clcf->handler = ngx_http_session_verify_handler;
+    clcf->handler = ngx_http_session_request_handler;
+
+    return NGX_CONF_OK;
+}
+
+/**
+ * Parsing method for the session_verify directive.  Registers/binds to
+ * the upstream instance and registers the session request handler for
+ * incoming requests to this location.
+ *
+ * @param cf The module/location configuration instance reference.
+ * @param cmd Reference to the original directives for the module.
+ * @param conf Configuration content for the module instance.
+ * @return Status result for the configuration parsing/setup.
+ */
+static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
+                                     void *conf) {
+    ngx_http_session_loc_conf_t *slcf = conf;
+    ngx_str_t *values = (ngx_str_t *) cf->args->elts;
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_url_t url;
+
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                   "*** session manager: verify for %.*s [to %.*s]",
+                   values[1].len, values[1].data,
+                   values[2].len, values[2].data);
+
+    /* This directive can only be used once (non-merging) */
+    if (slcf->manager.upstream != NULL) {
+        return "- duplicate instance specified";
+    }
+
+    /* Attach to the defined upstream instance (or error if invalid) */
+    ngx_memzero(&url, sizeof(ngx_url_t));
+    url.url = values[1];
+    url.no_resolve = 1;
+
+    slcf->manager.upstream = ngx_http_upstream_add(cf, &url, 0);
+    if (slcf->manager.upstream == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    /* Underlying command for the request handler */
+    slcf->sess_req = NGXMGR_VERIFY_SESSION;
+
+    /* Store the verified redirect target - @ or get */
+    slcf->valid_redirect_target = values[2];
+
+    /* Insert the request handler */
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_session_request_handler;
 
     return NGX_CONF_OK;
 }

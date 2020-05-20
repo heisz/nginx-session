@@ -1,7 +1,7 @@
 /**
  * Shared definitions for the session manager elements.
  * 
- * Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -14,6 +14,26 @@
 
 /* Might as well include this here */
 #include "messages.h"
+
+/* Storage type and global reference to process configuration settings */
+typedef struct {
+    /* Interface/address to listen for module requests on (default: any) */
+    char *svcBindAddr;
+
+    /* Bind port/service for client connections/requests (default: 5344) */
+    char *svcBindService;
+
+    /* Initial number of server connections in the event pool (default: 1024) */
+    size_t initialServerPoolSize;
+
+    /* Event loop connection polling size (default: 1024) */
+    size_t eventPollLimit;
+
+    /* Just being sneaky, this flag is only controlled by the signaller */
+    int shutdownRequested;
+} GlobalConfigType;
+
+extern GlobalConfigType GlobalConfig;
 
 /*
  * Container element for an instance of a connection from the nginx module.

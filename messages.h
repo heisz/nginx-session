@@ -1,7 +1,7 @@
 /**
  * Definition for messaging protocol of the nginx session management module.
  * 
- * Copyright (C) 2018-2019 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -26,7 +26,9 @@
 
 typedef enum NGXMGR_Command {
     /*
-     * Verify a user session for a request.  Incoming content is:
+     * For the primary two commands of the NGINX session module (see below),
+     * the following information is included in the outbound packet.
+     *
      *   - sessionId - standard string containing externally provided session
      *                 identifier or access token
      *   - sourceAddr - standard string containing IP address of the source
@@ -34,7 +36,20 @@ typedef enum NGXMGR_Command {
      *   - request - standard string containing amalgamated method/uri details
      *               of the request, for logging
      */
-    NGXMGR_VERIFY_SESSION = 0x01
+
+    /*
+     * Test the validity of the provided session identifier only, returns
+     * either the SESSION_INVALID or SESSION_CONTINUE response based on the
+     * validity of the session.  Request content was detailed above.
+     */
+    NGXMGR_VALIDATE_SESSION = 0x01,
+
+    /*
+     * Verify the session, returning either SESSION_CONTINUE if the session
+     * is valid or a suitable response to either initiate a login or push
+     * an error, based on conditions.  Request content was detailed above.
+     */
+    NGXMGR_VERIFY_SESSION = 0x02
 } NGXMGR_Command;
 
 typedef enum NGXMGR_Response {
@@ -45,19 +60,26 @@ typedef enum NGXMGR_Response {
     NGXMGR_RESPONSE_PENDING = 0x00,
 
     /*
+     * VALIDATE_SESSION response when the session is invalid but no action is
+     * to be taken by the module.  There is no additional content with this
+     * response, all directives are managed by the nginx configuration.
+     */
+    NGXMGR_SESSION_INVALID = 0x01,
+
+    /*
      * VALIDATE_SESSION response when the session is valid and processing
      * can continue (redirect by the nginx module).  There is no additional
      * content with this response, all directives are managed by the nginx
      * configuration.
      */
-    NGXMGR_SESSION_CONTINUE = 0x01,
+    NGXMGR_SESSION_CONTINUE = 0x02,
 
     /*
      * Response for any request, perform a 302 (temporarily moved) redirect
      * either for OAuth/SSO processing or login redirection.  Content contains
      * the text of the redirect location (not a length-lead string).
      */
-    NGXMGR_EXTERNAL_REDIRECT = 0x02,
+    NGXMGR_EXTERNAL_REDIRECT = 0x03,
 
     /*
      * Common response type for manager streamed content (verbatim).  Returns
@@ -67,7 +89,7 @@ typedef enum NGXMGR_Response {
      *     - associated page content, no length as the entire remainder
      *       of the message is the content
      */
-    NGXMGR_CONTENT_RESPONSE = 0x03,
+    NGXMGR_CONTENT_RESPONSE = 0x04,
 
     /*
      * Response for any request, issue an error response (mainly intended for
@@ -76,7 +98,7 @@ typedef enum NGXMGR_Response {
      *     - associated error page content, no length as the entire remainder
      *       of the message is the content
      */
-    NGXMGR_ERROR_RESPONSE = 0x04
+    NGXMGR_ERROR_RESPONSE = 0x05
 } NGXMGR_Response;
 
 #endif
