@@ -31,6 +31,9 @@ typedef struct {
     ngx_flag_t oauth_enabled;
     ngx_str_t session_property;
 
+    /* Associated profile definition in the manager for session management */
+    ngx_str_t profile_name;
+
     /* Target redirects for session-managed resource access */
     ngx_str_t valid_redirect_target;
     ngx_str_t invalid_redirect_target;

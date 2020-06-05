@@ -1,5 +1,5 @@
 /**
- * Primary nginx session management daemon entry point.
+ * Primary NGINX session management daemon entry point.
  * 
  * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
@@ -14,16 +14,15 @@
 #include <ctype.h>
 #include "manager.h"
 #include "buffer.h"
-#include "json.h"
 #include "log.h"
 #include "thread.h"
 #include "socket.h"
 #include "event.h"
 
 /* External declarations for missing header utilities */
-int daemonStart(const char *rootDir, const char *appName,
-                const char *pidFile, const char *logFileName,
-                void (*signalHandler)(int));
+void daemonStart(const char *rootDir, const char *appName,
+                 const char *pidFile, const char *logFileName,
+                  void (*signalHandler)(int));
 void daemonStop();
 
 /**
@@ -42,7 +41,7 @@ static void usage(int errorCode) {
 }
 static void version() {
     (void) fprintf(stdout,
-        "Nginx Session Manager Daemon - v0.1.0\n\n"
+        "NGINX Session Manager Daemon - v0.1.0\n\n"
         "Copyright (C) 2018-2020, J.M. Heisz.  All rights reserved.\n"
         "See the LICENSE file accompanying the distribution your rights to\n"
         "use this software.\n");
@@ -60,51 +59,73 @@ GlobalConfigType GlobalConfig = {
    /* svcBindService = */ NULL /* 5344 */,
    /* initialServerPoolSize = */ 1024,
    /* eventPollLimit = */ 1024,
-   0
+   /* sessionLogFileName = */ NULL,
+
+   /* ---- */
+
+   /* sessionLogFile = */ NULL,
+   /* profiles = */ {0, 0, 0, NULL},
+   /* shutdownRequested = */ 0
 };
 
-enum ConfigBindType {
-    BIND_STR, BIND_INT, BIND_SIZE
+static WXJSONBindDefn cfgBindings[] = {
+    { "service.bindAddress", WXJSONBIND_STR,
+      offsetof(GlobalConfigType, svcBindAddr), FALSE },
+    { "service.bindPort", WXJSONBIND_STR,
+      offsetof(GlobalConfigType, svcBindService), FALSE },
+    { "eventloop.poolSize", WXJSONBIND_SIZE,
+      offsetof(GlobalConfigType, initialServerPoolSize), FALSE },
+    { "eventloop.pollSize", WXJSONBIND_SIZE,
+      offsetof(GlobalConfigType, eventPollLimit), FALSE },
+    { "sessionLogFile", WXJSONBIND_STR,
+      offsetof(GlobalConfigType, sessionLogFileName), FALSE }
 };
 
-static struct ConfigBindInfo {
-    char *nodeName;
-    enum ConfigBindType bindType;
-    uint32_t bindOffset;
-} cfgBindings[] = {
-    { "service.bindAddress", BIND_STR,
-      offsetof(GlobalConfigType, svcBindAddr) },
-    { "service.bindPort", BIND_STR,
-      offsetof(GlobalConfigType, svcBindService) },
-    { "eventloop.poolSize", BIND_SIZE,
-      offsetof(GlobalConfigType, initialServerPoolSize) },
-    { "eventloop.pollSize", BIND_INT,
-      offsetof(GlobalConfigType, eventPollLimit) }
-};
+#define CFG_COUNT (sizeof(cfgBindings) / sizeof(WXJSONBindDefn))
 
-#define CFG_SETTINGS (sizeof(cfgBindings) / sizeof(struct ConfigBindInfo))
+/* Iteration method to parse profile configuration data */
+static int profileParse(WXHashTable *table, void *key, void *object,
+                        void *userData) {
+    WXJSONValue *config = (WXJSONValue *) object;
+    NGXMGR_Profile *profile;
 
-/* Utility method to validate config entries with type validation/logging */
-static WXJSONValue *configFindWithType(WXJSONValue *cfg, const char *name,
-                                       WXJSONValueType type) {
-    WXJSONValue *retval = WXJSON_Find(cfg, name);
-    if (retval == NULL) return NULL;
-    if (retval->type != type) {
-        WXLog_Error("Incorrect configuration data type for '%s'", name);
-        return NULL;
+    /* Find existing entry for reload, otherwise init */
+    if (GlobalConfig.profiles.entries == NULL) {
+        (void) WXHash_InitTable(&(GlobalConfig.profiles), 64);
     }
-    return retval;
+    profile = (NGXMGR_Profile *) WXHash_GetEntry(&(GlobalConfig.profiles),
+                                                 key, WXHash_StrCaseHashFn,
+                                                 WXHash_StrCaseEqualsFn);
+    if (profile != NULL) {
+        /* Note: errors would have logged internally */
+        (void) (profile->init)(profile, (char *) key, config);
+    } else {
+        profile = NGXMGR_AllocProfile((char *) key, config);
+        if (profile != NULL) {
+            if (!WXHash_InsertEntry(&(GlobalConfig.profiles),
+                                    (void *) profile->name, profile,
+                                    NULL, NULL, WXHash_StrCaseHashFn,
+                                    WXHash_StrCaseEqualsFn)) {
+                WXLog_Error("Internal error, failed to store profile data");
+            }
+        }
+        /* Note: errors would have logged internally */
+    }
+
+    return 0;
 }
+
+/* TODO - move reload into the events thread! */
 
 /**
  * Core function to load (or reload) the configuration information for the
- * manager, from the specified 
+ * manager, from the command line specified configuration file.
  */
 static void parseConfiguration() {
-    WXJSONValue *config, *val;
-    int idx, fd, inQuote = 0;
+    char *ptr, *str, errMsg[1024];
+    WXJSONValue *config, *profiles;
     WXBuffer fileContent;
-    char *ptr, *str;
+    int fd, inQuote = 0;
 
     /* Load the contents of the specified filename */
     if ((fd = open(configFileName, O_RDONLY)) < 0) {
@@ -141,13 +162,13 @@ static void parseConfiguration() {
         ptr++;
     }
 
-
     /* Trim and exit on empty file (avoids parse error) */
+    /* Really should log something, because it's not going to end well */
     ptr = (char *) fileContent.buffer;
     while (isspace(*ptr)) ptr++;
     if (*ptr == '\0') return;
 
-    /* And parse it */
+    /* Parse it and then use the JSON binding routines to translate root */
     if ((config = WXJSON_Decode((const char *) fileContent.buffer)) == NULL) {
         WXLog_Error("Failed to parse configuration data (mem error)");
         return;
@@ -161,41 +182,32 @@ static void parseConfiguration() {
     }
     WXBuffer_Destroy(&fileContent);
 
-    /* Use the binding table, Luke! */
-    for (idx = 0; idx < CFG_SETTINGS; idx++) {
-        ptr = ((char *) &GlobalConfig) + cfgBindings[idx].bindOffset;
+    if (!WXJSON_Bind(config, &GlobalConfig, cfgBindings, CFG_COUNT,
+                     errMsg, sizeof(errMsg))) {
+        WXLog_Error("Configuration binding error: %s", errMsg);
+        WXJSON_Destroy(config);
+        return;
+    }
 
-        switch (cfgBindings[idx].bindType) {
-            case BIND_STR:
-                val = configFindWithType(config, cfgBindings[idx].nodeName,
-                                         WXJSONVALUE_STRING);
-                if (val != NULL) {
-                    if (*((char **) ptr) != NULL) WXFree(*((char **) ptr));
-                    *((char **) ptr) = WXMalloc(strlen(val->value.sval) + 1);
-                    if (*((char **) ptr) != NULL) {
-                        (void) strcpy(*((char **) ptr), val->value.sval);
-                    }
-                } else {
-                    *((char **) ptr) = NULL;
-                }
-                break;
-
-            case BIND_INT:
-                val = configFindWithType(config, cfgBindings[idx].nodeName,
-                                         WXJSONVALUE_INT);
-                if (val != NULL) {
-                    *((int *) ptr) = val->value.ival;
-                }
-                break;
-
-            case BIND_SIZE:
-                val = configFindWithType(config, cfgBindings[idx].nodeName,
-                                         WXJSONVALUE_INT);
-                if (val != NULL) {
-                    *((size_t *) ptr) = val->value.ival;
-                }
-                break;
+    /* Reset logging */
+    if (GlobalConfig.sessionLogFile != NULL) {
+        (void) fclose(GlobalConfig.sessionLogFile);
+        GlobalConfig.sessionLogFile = NULL;
+    }
+    if (GlobalConfig.sessionLogFileName != NULL) {
+        GlobalConfig.sessionLogFile =
+                         fopen(GlobalConfig.sessionLogFileName, "a");
+        if (GlobalConfig.sessionLogFile == NULL) {
+            WXLog_Error("Unable to open logging file: %s", strerror(errno));
         }
+    }
+
+    /* (Re)build the hash of profiles */
+    profiles = WXJSON_Find(config, "profiles");
+    if ((profiles == NULL) || (profiles->type != WXJSONVALUE_OBJECT)) {
+        WXLog_Error("Missing or invalid object for 'profiles' entry");
+    } else {
+        (void) WXHash_Scan(&(profiles->value.oval), profileParse, NULL);
     }
 
     WXJSON_Destroy(config);
@@ -205,13 +217,13 @@ static void parseConfiguration() {
 void coreSignalHandler(int sig) {
     /* All good things must come to an end... */
     if ((sig == SIGINT) || (sig == SIGTERM)) {
-        WXLog_Info("Nginx session manager process exiting...");
+        WXLog_Info("NGINX session manager process exiting...");
         GlobalConfig.shutdownRequested = TRUE;
     }
 
     /* Reconfiguration signal... */
     if (sig == SIGHUP) {
-        WXLog_Info("Nginx session manager reloading configuration...");
+        WXLog_Info("NGINX session manager reloading configuration...");
         parseConfiguration();
     }
 }
@@ -267,7 +279,7 @@ int main(int argc, char **argv) {
     }
 
     /* Mark the process start in the log */
-    WXLog_Info("Nginx session manager process starting...");
+    WXLog_Info("NGINX session manager process starting...");
     WXLog_Info("Build: %s%s%s", CONFIGUREDATE,
                ((strlen(BUILDLABEL) == 0) ? "" : " - "),
                BUILDLABEL);

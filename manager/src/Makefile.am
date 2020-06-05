@@ -18,9 +18,11 @@ AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
               @MYSQL_INCLUDE@ @PGSQL_INCLUDE@ \
               -DSYSCONF_DIR='"$(sysconfdir)"'
 
-ngxsessmgr_SOURCES = manager.c requests.c \
+ngxsessmgr_SOURCES = manager.c requests.c profiles.c \
                   ../toolkit/src/db/dbxf.c \
+                  ../toolkit/src/lang/encoding.c \
                   ../toolkit/src/lang/json.c \
+                  ../toolkit/src/lang/xml.c \
                   ../toolkit/src/network/event.c \
                   ../toolkit/src/network/socket.c \
                   ../toolkit/src/utility/array.c \
@@ -40,7 +42,7 @@ if INCLUDE_PGSQL_DRV
 ngxsessmgr_SOURCES += ../toolkit/src/db/pgsql/dbfpgsql.c
 endif
 
-ngxsessmgr_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ -lpthread -lm
+ngxsessmgr_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ -lz -lcrypto -lpthread -lm
 
 # Clone the example configuration file
 ngxsessmgr_confdir = $(sysconfdir)

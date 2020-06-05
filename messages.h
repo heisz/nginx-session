@@ -29,12 +29,16 @@ typedef enum NGXMGR_Command {
      * For the primary two commands of the NGINX session module (see below),
      * the following information is included in the outbound packet.
      *
-     *   - sessionId - standard string containing externally provided session
-     *                 identifier or access token
-     *   - sourceAddr - standard string containing IP address of the source
-     *                  request, for logging and optional validation
-     *   - request - standard string containing amalgamated method/uri details
-     *               of the request, for logging
+     *   profileName: the session management profile to use for processing
+     *   sessionId: standard string containing externally provided session
+     *              identifier or access token
+     *   sourceAddr: standard string containing IP address of the source
+     *               request, for logging and optional validation
+     *   request: standard string containing amalgamated method/uri details
+     *            of the request, for logging
+     *
+     * For processing efficiency, all of the strings above are separated by
+     * a null terminator (the individual lengths are still correct).
      */
 
     /*
