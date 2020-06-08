@@ -21,24 +21,58 @@
  */
 static ngx_int_t ngx_http_session_create_request(ngx_http_request_t *req) {
     ngx_http_session_request_ctx_t *ctx;
-    ngx_chain_t *chn;
+    ngx_chain_t *chn, *lnk;
+    ngx_int_t blen = 0;
     ngx_buf_t *buff;
+    uint8_t cmd;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: creating upstream request");
 
+    /* Verify body content availability (memory) and compute net length */
+    /* Not clear if content_length_n is updated by NGINX, follow examples... */
+    if (req->request_body->temp_file != NULL) {
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
+                      "Session POST actions must fit into memory buffer, "
+                      "adjust client_body_buffer_size > [%d bytes]",
+                      (int) req->headers_in.content_length_n);
+        return NGX_HTTP_INSUFFICIENT_STORAGE;
+    }
+    lnk = req->request_body->bufs;
+    while (lnk != NULL) {
+        blen += ngx_buf_size(lnk->buf);
+        lnk = lnk->next;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                   "*** session manager: request data %d bytes", (int) blen);
+
     /* Need the original request context for the send data */
     ctx = ngx_http_get_module_ctx(req, ngx_http_session_module);
+    cmd = *(ctx->request_content);
 
     /* Create a buffer instance and populate it with the original request */
-    buff = ngx_create_temp_buf(req->pool, ctx->request_length);
+    buff = ngx_create_temp_buf(req->pool, ctx->request_length + blen);
     if (buff == NULL) return NGX_ERROR;
     buff->last = ngx_copy(buff->last, ctx->request_content,
                           ctx->request_length);
 
+    /* Append body content as provided, rewriting length */
+    if (blen != 0) {
+        lnk = req->request_body->bufs;
+        while (lnk != NULL) {
+            buff->last = ngx_copy(buff->last, lnk->buf->pos,
+                                  ngx_buf_size(lnk->buf));
+            lnk = lnk->next;
+        }
+
+        *((uint32_t *) buff->pos) = htonl(ngx_buf_size(buff) - 4);
+        *(buff->pos) = cmd;
+    }
+
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: chaining outbound buffer: %d bytes",
-                   (int) ctx->request_length);
+                   (int) ngx_buf_size(buff));
 
     /* Build a buffer chain with the allocated buffer as content */
     chn = ngx_alloc_chain_link(req->pool);
@@ -86,29 +120,30 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     ngx_http_upstream_t *upstr = req->upstream;
     ngx_http_session_request_ctx_t *ctx =
                         ngx_http_get_module_ctx(req, ngx_http_session_module);
-    uint32_t respLen, buffLen;
-    uint16_t typeLen;
+    uint32_t resp_len, buff_len;
+    uint16_t type_len;
     u_char code;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: process header");
 
     /* Read again until entire binary header can be processed */
-    buffLen = upstr->buffer.last - upstr->buffer.pos;
-    if (buffLen < 4) return NGX_AGAIN;
-    respLen = ntohl(*((uint32_t *) upstr->buffer.pos)) & 0x00FFFFFF;
+    buff_len = upstr->buffer.last - upstr->buffer.pos;
+    if (buff_len < 4) return NGX_AGAIN;
+    resp_len = ntohl(*((uint32_t *) upstr->buffer.pos)) & 0x00FFFFFF;
     code = *(upstr->buffer.pos);
-    upstr->length = respLen + 4;
+    upstr->length = resp_len + 4;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: manager response %s: %d bytes",
-                   ngx_https_session_rcstr[code], (int) respLen);
+                   ngx_https_session_rcstr[code], (int) resp_len);
 
     /* Five types of responses, the key one being the continue redirect! */
     if (code == NGXMGR_SESSION_INVALID) {
         /* Full response is required (but should be here, being empty) */
 
-        /* See note below, also would have liked to return DECLINED so that
+        /*
+         * See note below, also would have liked to return DECLINED so that
          * the upstream could fall through in this case, no such luck.  Either
          * switch to the target or issue an unauthorized error condition.
          */
@@ -116,7 +151,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
             /* TODO - should we inject page content for display? */
             upstr->headers_in.content_length_n = 0;
             upstr->headers_in.status_n = NGX_HTTP_UNAUTHORIZED;
-            upstr->buffer.pos += 4 + respLen;
+            upstr->buffer.pos += 4 + resp_len;
             upstr->keepalive = 1;
             return NGX_OK;
         } else {
@@ -130,7 +165,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
                                     ctx->slcf->invalid_redirect_target;
             upstr->headers_in.content_length_n = 0;
             upstr->headers_in.status_n = NGX_HTTP_OK;
-            upstr->buffer.pos += 4 + respLen;
+            upstr->buffer.pos += 4 + resp_len;
             upstr->keepalive = 1;
         }
 
@@ -140,7 +175,8 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     if (code == NGXMGR_SESSION_CONTINUE) {
         /* Full response is required (but should be here, being empty) */
 
-        /* Note: there was a lot of experimentation with redirect, but it kept
+        /*
+         * Note: there was a lot of experimentation with redirect, but it kept
          *       exploding because we are in upstream, not the primary handler.
          *       Eventually, realized that the accel-redirect mechanism was
          *       intended for things like php/lua, so hijacked that instead...
@@ -155,7 +191,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
                                 ctx->slcf->valid_redirect_target;
         upstr->headers_in.content_length_n = 0;
         upstr->headers_in.status_n = NGX_HTTP_OK;
-        upstr->buffer.pos += 4 + respLen;
+        upstr->buffer.pos += 4 + resp_len;
         upstr->keepalive = 1;
 
         return NGX_OK;
@@ -163,55 +199,55 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
 
     if (code == NGXMGR_EXTERNAL_REDIRECT) {
         /* Full response is required for redirect URL */
-        if (buffLen < respLen) return NGX_AGAIN;
+        if (buff_len < resp_len) return NGX_AGAIN;
 
         /* Push it to the location header */
         req->headers_out.location = ngx_list_push(&(req->headers_out.headers));
         if (req->headers_out.location == NULL) return NGX_ERROR;
         req->headers_out.location->hash = 1;
         ngx_str_set(&(req->headers_out.location->key), "Location");
-        req->headers_out.location->value.len = respLen;
-        req->headers_out.location->value.data = ngx_palloc(req->pool, respLen);
+        req->headers_out.location->value.len = resp_len;
+        req->headers_out.location->value.data = ngx_palloc(req->pool, resp_len);
         if (req->headers_out.location->value.data == NULL) return NGX_ERROR;
         ngx_memcpy(req->headers_out.location->value.data,
-                   upstr->buffer.pos + 4, respLen);
+                   upstr->buffer.pos + 4, resp_len);
 
-        /* And redirect */
-        upstr->length = upstr->headers_in.content_length_n = 0;
+        /* Entire response is just a header set of redirect */
+        upstr->headers_in.content_length_n = 0;
         upstr->headers_in.status_n = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->state->status = NGX_HTTP_MOVED_TEMPORARILY;
-        upstr->buffer.pos += 4 + respLen;
-        upstr->keepalive = 1;
+        upstr->buffer.pos += 4 + resp_len;
         req->header_only = 1;
+        upstr->keepalive = 1;
 
         return NGX_OK;
     }
 
     /* Errors and content only differ in their status code and content type */
     if (code == NGXMGR_CONTENT_RESPONSE) {
-        if (buffLen < 6) return NGX_AGAIN;
-        typeLen = ntohs(*((uint16_t *) (upstr->buffer.pos + 4)));
-        if (buffLen < (uint32_t) (typeLen + 6)) return NGX_AGAIN;
+        if (buff_len < 6) return NGX_AGAIN;
+        type_len = ntohs(*((uint16_t *) (upstr->buffer.pos + 4)));
+        if (buff_len < (uint32_t) (type_len + 6)) return NGX_AGAIN;
 
         /* Outbound content type comes from response */
-        req->headers_out.content_type.len = typeLen;
-        req->headers_out.content_type.data = ngx_palloc(req->pool, typeLen);
+        req->headers_out.content_type.len = type_len;
+        req->headers_out.content_type.data = ngx_palloc(req->pool, type_len);
         if (req->headers_out.content_type.data == NULL) return NGX_ERROR;
         ngx_memcpy(req->headers_out.content_type.data,
-                   upstr->buffer.pos + 6, typeLen);
+                   upstr->buffer.pos + 6, type_len);
         req->headers_out.content_type_lowcase = NULL;
 
         /* Remainder is streamed from incoming response */
-        upstr->length = upstr->headers_in.content_length_n = respLen - 2 - typeLen;
+        upstr->headers_in.content_length_n = resp_len - 2 - type_len;
         upstr->headers_in.status_n = upstr->state->status = NGX_HTTP_OK;
-        upstr->buffer.pos += 6 + typeLen;
+        upstr->buffer.pos += 6 + type_len;
         upstr->keepalive = 1;
 
         return NGX_OK;
     }
 
     if (code == NGXMGR_ERROR_RESPONSE) {
-        if (buffLen < 6) return NGX_AGAIN;
+        if (buff_len < 6) return NGX_AGAIN;
 
         /* Error page content is always HTML */
         req->headers_out.content_type_len = sizeof("text/html") - 1;
@@ -219,13 +255,9 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         req->headers_out.content_type_lowcase = NULL;
 
         /* Remainder is streamed from incoming response */
-        upstr->headers_in.content_length_n = respLen - 2;
+        upstr->headers_in.content_length_n = resp_len - 2;
         upstr->headers_in.status_n = upstr->state->status =
                                ntohs(*((uint16_t *) (upstr->buffer.pos + 4)));
-        upstr->length = upstr->headers_in.content_length_n -
-                        (buffLen - 6);
-fprintf(stderr, "HERE %d %d\n", (int) upstr->headers_in.content_length_n,
-                (int) upstr->length);
         upstr->buffer.pos += 6;
         upstr->keepalive = 1;
 
@@ -263,13 +295,58 @@ static void ngx_http_session_finalize_request(ngx_http_request_t *req,
                    "*** session manager: finalize request %d", rc);
 }
 
-/*
- * Note: at one point (experimentation) I had defined filter chains in here
- *       to get response output to appear.  But it turns out that they aren't
- *       needed (at present) since the response is sent verbatim.  All of the
- *       setup is accomplished in the header processing method and the
- *       nginx engine takes it from there...
+/**
+ * Turns out we need filter chains to properly handle the keepalive length
+ * processing for the manager engine.
  */
+static ngx_int_t ngx_http_session_filter_init(void *data) {
+    ngx_http_session_request_ctx_t *ctx =
+                      (ngx_http_session_request_ctx_t *) data;
+    ngx_http_upstream_t *upstr = ctx->request->upstream;
+
+    /*
+     * Long story short.  Setting upstream length in process_header does not
+     * work, because core NGINX handler resets length to -1 (read until upstream
+     * closes).  So need to have an input filter to set the length, which
+     * happens after header processing.
+     */
+    upstr->length = upstr->headers_in.content_length_n;
+    upstr->keepalive = 1;
+
+    return NGX_OK;
+}
+
+/* Note: this is essentially ngx_http_upstream_non_buffered_filter (static) */
+static ngx_int_t ngx_http_session_filter(void *data, ssize_t bytes) {
+    ngx_http_session_request_ctx_t *ctx =
+                      (ngx_http_session_request_ctx_t *) data;
+    ngx_http_upstream_t *upstr = ctx->request->upstream;
+    ngx_chain_t *cl, **ll;
+    ngx_buf_t *b;
+
+    /* Allocate a free chain buffer onto the end of the upstream */
+    ll = &(upstr->out_bufs); 
+    for (cl = upstr->out_bufs; cl != NULL; cl = cl->next) {
+        ll = &(cl->next);
+    }
+    cl = ngx_chain_get_free_buf(ctx->request->pool, &(upstr->free_bufs));
+    if (cl == NULL) return NGX_ERROR;
+    *ll = cl;
+
+    /* Transfer the byte stream to the output buffer */
+    b = &(upstr->buffer);
+    cl->buf->pos = b->last;
+    b->last += bytes;
+    cl->buf->last = b->last;
+    cl->buf->tag = upstr->output.tag;
+    cl->buf->flush = 1;
+    cl->buf->memory = 1;
+
+    /* All this to get to this action... */
+    upstr->length -= bytes;
+
+    return NGX_OK;
+}
 
 /**
  * Create a new upstream instance for issuing an underlying request to the
@@ -285,12 +362,13 @@ ngx_int_t ngx_http_session_create_upstream(ngx_http_session_loc_conf_t *smcf,
                                            ngx_http_request_t *req,
                                            ngx_http_session_request_ctx_t *ctx){
     ngx_http_upstream_t *upstr;
+    ngx_int_t rc;
 
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                   "*** session manager: creating upstream request instance");
 
     /* Create the upstream data instance */
-    if (ngx_http_upstream_create(req) != NGX_OK) {
+    if ((rc = ngx_http_upstream_create(req)) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     upstr = req->upstream;
@@ -306,14 +384,20 @@ ngx_int_t ngx_http_session_create_upstream(ngx_http_session_loc_conf_t *smcf,
     upstr->abort_request = ngx_http_session_abort_request;
     upstr->finalize_request = ngx_http_session_finalize_request;
 
-    /* If needed (see above), filtering methods could be defined here */
+    /* Attach a no-op filter to properly set the upstream length */
+    upstr->input_filter_init = ngx_http_session_filter_init;
+    upstr->input_filter = ngx_http_session_filter;
+    upstr->input_filter_ctx = ctx;
 
-    /* Attach to the underlying request instance */
-    req->upstream = upstr;
-    req->main->count++;
+    /*
+     * Notes from experimentation, if you discard the body, need to increment
+     * req->main->count.  But if reading the body, don't do that or you end 
+     * up in a loop of unfinished requests...
+     */
 
-    /* Bombs away! */
-    ngx_http_upstream_init(req);
+    /* Collect any incoming POST data and process upstream */
+    rc = ngx_http_read_client_request_body(req, ngx_http_upstream_init);
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE) return rc;
 
-    return NGX_OK;
+    return NGX_DONE;
 }

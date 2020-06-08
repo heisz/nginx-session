@@ -313,7 +313,7 @@ static const char *get_method_name(ngx_int_t method) {
 static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     ngx_http_session_loc_conf_t *slcf;
     ngx_http_session_request_ctx_t *ctx;
-    ngx_int_t rc, la, lb, lc, ld, le;
+    ngx_int_t la, lb, lc, ld, le;
     ngx_str_t session_id;
     uint8_t *ptr;
 
@@ -330,7 +330,7 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     ngx_memzero(&session_id, sizeof(session_id));
     if (slcf->cookie_id.len != 0) {
         /* Actually don't really care about the index, just the value */
-        rc = ngx_http_parse_multi_header_lines(&(req->headers_in.cookies),
+        la = ngx_http_parse_multi_header_lines(&(req->headers_in.cookies),
                                                &(slcf->cookie_id), &session_id);
     }
     if ((session_id.len == 0) && (slcf->oauth_enabled)) {
@@ -384,14 +384,8 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     ctx->slcf = slcf;
     ngx_http_set_ctx(req, ctx, ngx_http_session_module);
 
-    /* TODO - ACTION POST wait for content */
-
-    /* Generate/push to the upstream data instance */
-    if ((rc = ngx_http_session_create_upstream(slcf, req, ctx)) != NGX_OK) {
-        return rc;
-    }
-
-    return NGX_DONE;
+    /* Generate/push to the upstream data instance, with POST handling */
+    return ngx_http_session_create_upstream(slcf, req, ctx);
 }
 
 /**
