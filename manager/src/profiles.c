@@ -111,9 +111,9 @@ static char *allocError = "\01\364" /* Response code 500 */
 static char *ssoGenError = "\01\364" /* Response code 500 */
                            "Internal Error: failure in SAML redirect.\n";
 
-/* Processing method for the SAML profile, either post completion or get init */
-static void (SAMLProcess)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
-                          char *action) {
+/* Verify processing method for the SAML profile, establish new session */
+static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
+                                char *request) {
     char *url, *enc, *sessReqId, xmlBuff[1024], *deflateBuff, tmBuff[64];
     SAMLProfile *profile = (SAMLProfile *) prf;
     WXMLNamespace *samlNs, *samlpNs, authNs;
@@ -124,10 +124,6 @@ static void (SAMLProcess)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     BUF_MEM *bptr;
     time_t now;
     int zrc;
-
-    /* TODO - command for completion?  */
-
-    /* Any fallthrough is a restart of the SAML login sequence */
 
     /* TODO - Allocate a pending session instance */
     sessReqId = "TEST_123456";
@@ -221,7 +217,7 @@ static void (SAMLProcess)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             ((zrc = deflateEnd(&deflateStrm)) != Z_OK)) {
         WXLog_Error("Zlib default failure: [%d] %s", zrc, zError(zrc));
         NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                             ssoGenError, strlen(ssoGenError) + 2);
+                             ssoGenError, strlen(ssoGenError + 2) + 2);
         return;
     }
            
@@ -252,11 +248,19 @@ memfail:
     if (base64Enc != NULL) BIO_free_all(base64Enc);
     WXLog_Error("Memory allocation failure!");
     NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                         allocError, strlen(allocError) + 2);
+                         allocError, strlen(allocError + 2) + 2);
+}
+
+/* Process SAML commands, establish completion or logout */
+static void (SAMLProcessAction)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
+                                char *request, char *action, char *sessionId) {
+    /* Bogus for now! */
+    NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
+                         allocError, strlen(allocError + 2) + 2);
 }
 
 static NGXMGR_Profile SAMLBaseProfile = {
-    "saml", NULL, SAMLInit, SAMLProcess
+    "saml", NULL, SAMLInit, SAMLProcessVerify, SAMLProcessAction
 };
 
 static NGXMGR_Profile *profileTypes[] = {

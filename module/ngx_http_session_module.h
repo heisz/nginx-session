@@ -37,6 +37,9 @@ typedef struct {
     /* Target redirects for session-managed resource access */
     ngx_str_t valid_redirect_target;
     ngx_str_t invalid_redirect_target;
+
+    /* Command/action for session control action instances */
+    ngx_str_t action;
 } ngx_http_session_loc_conf_t;
 
 /* Associated context information for the upstream manager request handling */

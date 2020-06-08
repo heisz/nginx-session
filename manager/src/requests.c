@@ -120,7 +120,7 @@ void NGXMGR_IssueResponse(NGXModuleConnection *conn, uint8_t code,
 
 /* Special responses for internal system errors */
 /* TODO - make these pretty or do we really care since they shouldn't happen? */
-static char *protocolError = "\01\364" /* Response code 500 */
+static char *protoError = "\01\364" /* Response code 500 */
                              "Internal Error: invalid message protocol.\n";
 static char *configError = "\01\364" /* Response code 500 */
                            "Internal Error: improper manager configuration.\n";
@@ -136,10 +136,11 @@ static char *errContent = "\01\223Not Allowed!\n";
  * @param events Bitmask of events that have been received.
  */
 void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
-    char *ptr, *sessionId, *sourceIpAddr, *action, timestamp[128];
+    char *ptr, *action = NULL, *sessionId, *sourceIpAddr, *request;
     int l, len, rc, sessionIsValid = FALSE;
-
     NGXMGR_Profile *profile;
+    char timestamp[128];
+    uint8_t command;
 
     /* Flush pending write operations before reading more (shouldn't be any) */
     if ((events & WXEVENT_OUT) != 0) {
@@ -224,6 +225,7 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         conn->request.length += rc;
         if (conn->request.length < conn->requestLength) return;
         conn->requestLength = 0;
+        command = *(conn->requestHeader);
 
 #ifdef NGXMGR_TRACE_MSG
         WXLog_Binary(WXLOG_DEBUG, conn->request.buffer, 0,
@@ -232,13 +234,26 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         ptr = conn->request.buffer;
         len = conn->request.length;
 
-        /* Right up front, log and validate the session, shortest path! */
+        /* Right up front, parse, log and validate the session! */
+        if (command == NGXMGR_SESSION_ACTION) {
+            l = ntohs(*((uint16_t *) ptr));
+            ptr += 2; len -= 2;
+            if ((l > len) || (*(ptr + l) != '\0')) {
+                WXLog_Error("Protocol error, invalid session action");
+                NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
+                                     protoError, strlen(protoError + 2) + 2);
+                return;
+            }
+            action = ptr;
+            l++; ptr += l; len -= l;
+        }
+
         l = ntohs(*((uint16_t *) ptr));
         ptr += 2; len -= 2;
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid profile identifier");
             NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protocolError, strlen(protocolError) + 2);
+                                 protoError, strlen(protoError + 2) + 2);
             return;
         }
         profile = (NGXMGR_Profile *) WXHash_GetEntry(&(GlobalConfig.profiles),
@@ -247,7 +262,7 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         if (profile == NULL) {
             WXLog_Error("Session request for unknown profile '%s'", ptr);
             NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 configError, strlen(configError) + 2);
+                                 configError, strlen(configError + 2) + 2);
             return;
         }
         l++; ptr += l; len -= l;
@@ -257,7 +272,7 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid session identifier");
             NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protocolError, strlen(protocolError) + 2);
+                                 protoError, strlen(protoError + 2) + 2);
             return;
         }
         sessionId = ptr;
@@ -268,7 +283,7 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid source IP address");
             NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protocolError, strlen(protocolError) + 2);
+                                 protoError, strlen(protoError + 2) + 2);
             return;
         }
         sourceIpAddr = ptr;
@@ -276,13 +291,15 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
 
         l = ntohs(*((uint16_t *) ptr));
         ptr += 2; len -= 2;
-        if ((l != len - 1) || (*(ptr + l) != '\0')) {
-            WXLog_Error("Protocol error, invalid action information");
+        if ((l > len) || (*(ptr + l) != '\0')) {
+            WXLog_Error("Protocol error, invalid request information");
             NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protocolError, strlen(protocolError) + 2);
+                                 protoError, strlen(protoError + 2) + 2);
             return;
         }
-        action = ptr;
+        request = ptr;
+
+        /* Any trailing elements are ACTION details, ignored for others */
 
         /* Validate session up front, so we can log determined state */
         /* TODO - use profile standards (fixed IP, for example) */
@@ -293,23 +310,31 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
             WXLog_GetFormattedTimestamp(timestamp);
 
             (void) fprintf(GlobalConfig.sessionLogFile,
-                           "%s %s[%s:%s->%s] %s\n",
-                           timestamp, profile->name, sessionId, sourceIpAddr,
-                           ((sessionIsValid) ? "Y" : "N"), action);
+                           "%s %s%s%s[%s:%s->%s] %s\n",
+                           timestamp, profile->name,
+                           ((action != NULL) ? ":" : ""), action,
+                           sessionId, sourceIpAddr,
+                           ((sessionIsValid) ? "Y" : "N"), request);
             (void) fflush(GlobalConfig.sessionLogFile);
         }
 
         /* Certain conditions are immediately resolvable */
-        if (sessionIsValid) {
-            /* All requests just continue if session is validated */
+        if ((sessionIsValid) && (command != NGXMGR_SESSION_ACTION)) {
+            /* All verify requests just continue if session is validated */
             NGXMGR_IssueResponse(conn, NGXMGR_SESSION_CONTINUE, "", 0);
-        } else if (*(conn->requestHeader) == NGXMGR_VALIDATE_SESSION) {
+        } else if (command == NGXMGR_VALIDATE_SESSION) {
             /* For validate, only response is invalid if not valid */
             NGXMGR_IssueResponse(conn, NGXMGR_SESSION_INVALID, "", 0);
+           
+        } else {
+            /* Let the profile handle the remaining request actions */
+            if (command == NGXMGR_VERIFY_SESSION) {
+                (profile->processVerify)(profile, conn, request);
+            } else {
+                (profile->processAction)(profile, conn, request, action,
+                                         sessionId);
+            }
         }
-
-        /* Invalid session with continuation - allow profile to respond */
-        (profile->process)(profile, conn, action);
 
 #if 0
         /* REMOVE!!! */

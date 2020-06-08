@@ -16,6 +16,8 @@ static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
                                        void *conf);
 static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
                                      void *conf);
+static char *ngx_http_session_action(ngx_conf_t *cf, ngx_command_t *cmd,
+                                     void *conf);
 static char *ngx_http_session_status(ngx_conf_t *cf, ngx_command_t *cmd,
                                      void *conf);
 
@@ -77,6 +79,12 @@ static ngx_command_t ngx_http_session_commands[] = {
     { ngx_string("session_verify"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE3 | NGX_CONF_TAKE4, 
       ngx_http_session_verify,
+      NGX_HTTP_LOC_CONF_OFFSET, 
+      0, NULL},
+
+    { ngx_string("session_action"),
+      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE3,
+      ngx_http_session_action,
       NGX_HTTP_LOC_CONF_OFFSET, 
       0, NULL},
 
@@ -158,6 +166,7 @@ static void *ngx_http_session_create_loc_conf(ngx_conf_t *cf) {
     conf->manager.force_ranges = 1;
 
     /* Other bits more specific to the session management module itself */
+    // conf->action = { 0, NULL };
     // conf->profile_name = { 0, NULL };
     // conf->valid_redirect_target = { 0, NULL };
     // conf->invalid_redirect_target = { 0, NULL };
@@ -223,6 +232,7 @@ static char *ngx_http_session_merge_loc_conf(ngx_conf_t *cf,
     }
 
     /* Also merge the local settings as appropriate */
+    ngx_conf_merge_str(conf->action, prev->action);
     ngx_conf_merge_str(conf->profile_name, prev->profile_name);
     ngx_conf_merge_str(conf->valid_redirect_target,
                        prev->valid_redirect_target);
@@ -303,7 +313,7 @@ static const char *get_method_name(ngx_int_t method) {
 static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     ngx_http_session_loc_conf_t *slcf;
     ngx_http_session_request_ctx_t *ctx;
-    ngx_int_t rc, la, lb, lc, ld;
+    ngx_int_t rc, la, lb, lc, ld, le;
     ngx_str_t session_id;
     uint8_t *ptr;
 
@@ -333,11 +343,15 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    /* TODO - possible short-cut cache for local redirect/verify? */
+
     /* And build the outbound verify request */
-    ctx->request_length = 4 + 3 + (la = slcf->profile_name.len) +
-                              3 + (lb = session_id.len) +
-                              3 + (lc = req->connection->addr_text.len) +
-                              7 + (ld = req->uri.len);
+    ctx->request_length = 4 + 3 + (la = slcf->action.len) +
+                              3 + (lb = slcf->profile_name.len) +
+                              3 + (lc = session_id.len) +
+                              3 + (ld = req->connection->addr_text.len) +
+                              7 + (le = req->uri.len);
+    if (slcf->sess_req != NGXMGR_SESSION_ACTION) ctx->request_length -= 3;
     ctx->request_content = ngx_pcalloc(req->pool, ctx->request_length + 1);
     if ((ptr = ctx->request_content) == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -345,25 +359,32 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     *((uint32_t *) ptr) = htonl(ctx->request_length - 4);
     *ptr = (uint8_t) slcf->sess_req; ptr += 4;
 
-    *((uint16_t *) ptr) = htons(la); ptr += 2;
-    ngx_memcpy(ptr, slcf->profile_name.data, la); ptr += la;
-    *(ptr++) = '\0';
+    if (slcf->sess_req == NGXMGR_SESSION_ACTION) {
+        *((uint16_t *) ptr) = htons(la); ptr += 2;
+        ngx_memcpy(ptr, slcf->action.data, la); ptr += la;
+        *(ptr++) = '\0';
+    }
     *((uint16_t *) ptr) = htons(lb); ptr += 2;
-    ngx_memcpy(ptr, session_id.data, lb); ptr += lb;
+    ngx_memcpy(ptr, slcf->profile_name.data, lb); ptr += lb;
     *(ptr++) = '\0';
     *((uint16_t *) ptr) = htons(lc); ptr += 2;
-    ngx_memcpy(ptr, req->connection->addr_text.data, lc); ptr += lc;
+    ngx_memcpy(ptr, session_id.data, lc); ptr += lc;
     *(ptr++) = '\0';
-    *((uint16_t *) ptr) = htons((ld + 4)); ptr += 2;
+    *((uint16_t *) ptr) = htons(ld); ptr += 2;
+    ngx_memcpy(ptr, req->connection->addr_text.data, ld); ptr += ld;
+    *(ptr++) = '\0';
+    *((uint16_t *) ptr) = htons((le + 4)); ptr += 2;
     ngx_memcpy(ptr, get_method_name(req->method), 3); ptr += 3;
     *(ptr++) = ' ';
-    ngx_memcpy(ptr, req->uri.data, ld); ptr += ld;
+    ngx_memcpy(ptr, req->uri.data, le); ptr += le;
     *(ptr++) = '\0';
 
     /* Attach to the request context */
     ctx->request = req;
     ctx->slcf = slcf;
     ngx_http_set_ctx(req, ctx, ngx_http_session_module);
+
+    /* TODO - ACTION POST wait for content */
 
     /* Generate/push to the upstream data instance */
     if ((rc = ngx_http_session_create_upstream(slcf, req, ctx)) != NGX_OK) {
@@ -478,6 +499,58 @@ static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
     if (cf->args->nelts > 4) {
         slcf->invalid_redirect_target = values[4];
     }
+
+    /* Insert the request handler */
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_session_request_handler;
+
+    return NGX_CONF_OK;
+}
+
+/**
+ * Parsing method for the session_action directive.  Registers/binds to
+ * the upstream instance and registers the session request handler for
+ * incoming requests to this location.
+ *
+ * @param cf The module/location configuration instance reference.
+ * @param cmd Reference to the original directives for the module.
+ * @param conf Configuration content for the module instance.
+ * @return Status result for the configuration parsing/setup.
+ */
+static char *ngx_http_session_action(ngx_conf_t *cf, ngx_command_t *cmd,
+                                     void *conf) {
+    ngx_http_session_loc_conf_t *slcf = conf;
+    ngx_str_t *values = (ngx_str_t *) cf->args->elts;
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_url_t url;
+
+    ngx_log_debug6(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                   "*** session manager: action for %.*s:%.*s [%.*s]",
+                   values[1].len, values[1].data,
+                   values[2].len, values[2].data,
+                   values[3].len, values[3].data);
+
+    /* This directive can only be used once (non-merging) */
+    if (slcf->manager.upstream != NULL) {
+        return "- duplicate instance specified";
+    }
+
+    /* Attach to the defined upstream instance (or error if invalid) */
+    ngx_memzero(&url, sizeof(ngx_url_t));
+    url.url = values[1];
+    url.no_resolve = 1;
+
+    slcf->manager.upstream = ngx_http_upstream_add(cf, &url, 0);
+    if (slcf->manager.upstream == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    /* Underlying command for the request handler */
+    slcf->sess_req = NGXMGR_SESSION_ACTION;
+
+    /* Store the action and profile */
+    slcf->profile_name = values[2];
+    slcf->action = values[3];
 
     /* Insert the request handler */
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);

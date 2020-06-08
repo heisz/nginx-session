@@ -26,16 +26,24 @@
 
 typedef enum NGXMGR_Command {
     /*
-     * For the primary two commands of the NGINX session module (see below),
+     * For the three commands of the NGINX session module (see below),
      * the following information is included in the outbound packet.
      *
-     *   profileName: the session management profile to use for processing
+     *   [action]: only appearing for the ACTION request, the associated named
+     *             action to associate to the request
+     *   profileName: appearing for all requests (either to manage session
+     *                validation or establishment), the session management
+     *                profile to use for processing
      *   sessionId: standard string containing externally provided session
-     *              identifier or access token
+     *              identifier or access token (note that one action could be
+     *              logout).  Empty if undefined
      *   sourceAddr: standard string containing IP address of the source
      *               request, for logging and optional validation
      *   request: standard string containing amalgamated method/uri details
      *            of the request, for logging
+     *   [data]: for ACTION instances associated to HTTP POST requests, the
+     *           remainder of the request after the strings is the binary
+     *           POST content
      *
      * For processing efficiency, all of the strings above are separated by
      * a null terminator (the individual lengths are still correct).
@@ -44,16 +52,26 @@ typedef enum NGXMGR_Command {
     /*
      * Test the validity of the provided session identifier only, returns
      * either the SESSION_INVALID or SESSION_CONTINUE response based on the
-     * validity of the session.  Request content was detailed above.
+     * validity of the session.  Request content will consist of the profile
+     * and session identifier, the sourceAddr and the request details.
      */
     NGXMGR_VALIDATE_SESSION = 0x01,
 
     /*
      * Verify the session, returning either SESSION_CONTINUE if the session
      * is valid or a suitable response to either initiate a login or push
-     * an error, based on conditions.  Request content was detailed above.
+     * an error, based on conditions.  Request content will consist of the
+     * profile and session identifier, the sourceAddr and the request details.
      */
-    NGXMGR_VERIFY_SESSION = 0x02
+    NGXMGR_VERIFY_SESSION = 0x02,
+
+    /*
+     * Perform a session action based on an incoming request.  Will return
+     * a suitable response based on result of operation.  Request content will
+     * consist of all of the available elements above, potentially including
+     * trailing data for POST conditions.
+     */
+    NGXMGR_SESSION_ACTION = 0x03
 } NGXMGR_Command;
 
 typedef enum NGXMGR_Response {

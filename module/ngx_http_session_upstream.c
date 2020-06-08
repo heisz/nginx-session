@@ -177,11 +177,12 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
                    upstr->buffer.pos + 4, respLen);
 
         /* And redirect */
-        upstr->headers_in.content_length_n = 0;
+        upstr->length = upstr->headers_in.content_length_n = 0;
         upstr->headers_in.status_n = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->state->status = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->buffer.pos += 4 + respLen;
         upstr->keepalive = 1;
+        req->header_only = 1;
 
         return NGX_OK;
     }
@@ -201,7 +202,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         req->headers_out.content_type_lowcase = NULL;
 
         /* Remainder is streamed from incoming response */
-        upstr->headers_in.content_length_n = respLen - 2 - typeLen;
+        upstr->length = upstr->headers_in.content_length_n = respLen - 2 - typeLen;
         upstr->headers_in.status_n = upstr->state->status = NGX_HTTP_OK;
         upstr->buffer.pos += 6 + typeLen;
         upstr->keepalive = 1;
@@ -221,6 +222,10 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         upstr->headers_in.content_length_n = respLen - 2;
         upstr->headers_in.status_n = upstr->state->status =
                                ntohs(*((uint16_t *) (upstr->buffer.pos + 4)));
+        upstr->length = upstr->headers_in.content_length_n -
+                        (buffLen - 6);
+fprintf(stderr, "HERE %d %d\n", (int) upstr->headers_in.content_length_n,
+                (int) upstr->length);
         upstr->buffer.pos += 6;
         upstr->keepalive = 1;
 
@@ -229,7 +234,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
 
     ngx_log_error(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                   "*** session manager: invalid manager response");
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    return NGX_HTTP_UPSTREAM_INVALID_HEADER;
 }
 
 /**

@@ -87,9 +87,13 @@ struct NGXMGR_Profile {
     NGXMGR_Profile *(*init)(NGXMGR_Profile *orig, const char *profileName,
                             WXJSONValue *config);
 
-    /* Everything flows through the single processing request */
-    void (*process)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
-                    char *action);
+    /* Process the outcome of a verify request that is invalid */
+    void (*processVerify)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
+                          char *request);
+
+    /* Process an explicit action against the profile/session */
+    void (*processAction)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
+                          char *request, char *action, char *sessionId);
 };
 
 /* Exposed allocation method for creating profiles instances from config */
