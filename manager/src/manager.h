@@ -70,9 +70,12 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events);
 void NGXMGR_UpdateEvents(NGXModuleConnection *conn, uint32_t events);
 void NGXMGR_DestroyConnection(NGXModuleConnection *conn);
 
-/* And the common response method (for use by the profiles) */
+/* And the common response methods (for use by the profiles) */
 void NGXMGR_IssueResponse(NGXModuleConnection *conn, uint8_t code,
                           uint8_t *response, uint32_t responseLength);
+void NGXMGR_IssueErrorResponse(NGXModuleConnection *conn, uint16_t errorCode,
+                               char *title, char *format, ...)
+                                    __attribute__((format(__printf__, 4, 5)));
 
 /*
  * Class and base instance structure for a session security profile.
@@ -93,7 +96,8 @@ struct NGXMGR_Profile {
 
     /* Process an explicit action against the profile/session */
     void (*processAction)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
-                          char *request, char *action, char *sessionId);
+                          char *request, char *action, char *sessionId,
+                          char *data, int dataLen);
 };
 
 /* Exposed allocation method for creating profiles instances from config */

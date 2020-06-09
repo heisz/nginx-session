@@ -106,10 +106,6 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
     return &(retval->base);
 }
 
-static char *allocError = "\01\364" /* Response code 500 */
-                          "Internal Error: memory allocation failure.\n";
-static char *ssoGenError = "\01\364" /* Response code 500 */
-                           "Internal Error: failure in SAML redirect.\n";
 
 /* Verify processing method for the SAML profile, establish new session */
 static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
@@ -216,8 +212,8 @@ static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             ((zrc = deflate(&deflateStrm, Z_FINISH)) != Z_STREAM_END) ||
             ((zrc = deflateEnd(&deflateStrm)) != Z_OK)) {
         WXLog_Error("Zlib default failure: [%d] %s", zrc, zError(zrc));
-        NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                             ssoGenError, strlen(ssoGenError + 2) + 2);
+        NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                           "Internal Error: failure in SAML redirect");
         return;
     }
            
@@ -247,16 +243,17 @@ static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
 memfail:
     if (base64Enc != NULL) BIO_free_all(base64Enc);
     WXLog_Error("Memory allocation failure!");
-    NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                         allocError, strlen(allocError + 2) + 2);
+    NGXMGR_IssueErrorResponse(conn, 500, "Memory Error",
+                       "Internal Error: Manager memory allocation error");
 }
 
 /* Process SAML commands, establish completion or logout */
 static void (SAMLProcessAction)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
-                                char *request, char *action, char *sessionId) {
+                                char *request, char *action, char *sessionId,
+                                char *data, int dataLen) {
     /* Bogus for now! */
-    NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                         allocError, strlen(allocError + 2) + 2);
+    NGXMGR_IssueErrorResponse(conn, 500, "It's an error!",
+                              "Test '%s' %d", "test", 12);
 }
 
 static NGXMGR_Profile SAMLBaseProfile = {

@@ -74,6 +74,7 @@ void NGXMGR_DestroyConnection(NGXModuleConnection *conn) {
  *
  * @param conn The connection instance to send the response on.
  * @param code The numeric response code for the answer.
+ * @param [errorCode] Alternatively, error code for explicit error conditions.
  * @param response Binary buffer of the response to issue.
  * @param responseLength Number of bytes in the response to send.
  */
@@ -84,14 +85,12 @@ void NGXMGR_IssueResponse(NGXModuleConnection *conn, uint8_t code,
 
 #ifdef NGXMGR_TRACE_MSG
     WXLog_Debug("Outgoing response %x, length %d", code, responseLength);
-    WXLog_Binary(WXLOG_DEBUG, response, 0, responseLength);
 #endif
 
     /* Assemble the response details */
     *((uint32_t *) header) = htonl(responseLength);
     header[0] = code;
 
-    WXBuffer_Empty(&(conn->response));
     if ((WXBuffer_Append(&(conn->response), header, 4, TRUE) == NULL) ||
             (WXBuffer_Append(&(conn->response), response, responseLength,
                              TRUE) == NULL)) {
@@ -100,7 +99,9 @@ void NGXMGR_IssueResponse(NGXModuleConnection *conn, uint8_t code,
         NGXMGR_DestroyConnection(conn);
         return;
     }
+#ifdef NGXMGR_TRACE_MSG
     WXLog_Binary(WXLOG_DEBUG, conn->response.buffer, 0, conn->response.length);
+#endif
 
     /* Attempt a write, resetting flags as required */
     rc = WXSocket_Send(conn->connectionHandle, conn->response.buffer,
@@ -118,16 +119,68 @@ void NGXMGR_IssueResponse(NGXModuleConnection *conn, uint8_t code,
     }
 }
 
-/* Special responses for internal system errors */
-/* TODO - make these pretty or do we really care since they shouldn't happen? */
-static char *protoError = "\01\364" /* Response code 500 */
-                             "Internal Error: invalid message protocol.\n";
-static char *configError = "\01\364" /* Response code 500 */
-                           "Internal Error: improper manager configuration.\n";
+static char *errorFormat =
+                "<html><head><title>%s</title></end><body>%s</body></html>";
 
-/* Currently, just present for testing (make large for buffering) */
-static char *dataContent = "\0\011text/htmlJeff Wuz Here\n";
-static char *errContent = "\01\223Not Allowed!\n";
+void NGXMGR_IssueErrorResponse(NGXModuleConnection *conn, uint16_t errorCode,
+                               char *title, char *format, ...) {
+    uint8_t header[6], msgBuff[1024];
+    WXBuffer buffer;
+    int len, rc;
+    va_list ap;
+
+#ifdef NGXMGR_TRACE_MSG
+    WXLog_Debug("Outgoing error: %d: %s", errorCode, title);
+#endif
+
+    /* Format the message content */
+    WXBuffer_InitLocal(&buffer, msgBuff, sizeof(msgBuff));
+    va_start(ap, format);
+    if (WXBuffer_VPrintf(&buffer, format, ap) == NULL) {
+        WXLog_Error("Unable to allocate error message content");
+        NGXMGR_UpdateEvents(conn, WXEVENT_CLOSE);
+        NGXMGR_DestroyConnection(conn);
+        va_end(ap);
+        return;
+    }
+    va_end(ap);
+
+    /* Encode the header, take care regarding HTML length */
+    len = strlen(errorFormat) - 4 + strlen(title) + strlen(buffer.buffer) + 2;
+    *((uint32_t *) header) = htonl(len);
+    *header = NGXMGR_ERROR_RESPONSE;
+    *((uint16_t *) (header + 4)) = ntohs(errorCode);
+
+    if ((WXBuffer_Append(&(conn->response), header, 6, TRUE) == NULL) ||
+            (WXBuffer_Printf(&(conn->response), errorFormat,
+                             title, buffer.buffer) == NULL)) {
+        WXLog_Error("Unable to allocate error response buffer");
+        NGXMGR_UpdateEvents(conn, WXEVENT_CLOSE);
+        NGXMGR_DestroyConnection(conn);
+        WXBuffer_Destroy(&buffer);
+        return;
+    }
+    WXBuffer_Destroy(&buffer);
+
+#ifdef NGXMGR_TRACE_MSG
+    WXLog_Binary(WXLOG_DEBUG, conn->response.buffer, 0, conn->response.length);
+#endif
+
+    /* Attempt a write, resetting flags as required */
+    rc = WXSocket_Send(conn->connectionHandle, conn->response.buffer,
+                       conn->response.length, 0);
+    if (rc < 0) {
+        WXLog_Error("Write error for error response: %s",
+                    WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
+        NGXMGR_UpdateEvents(conn, WXEVENT_CLOSE);
+        NGXMGR_DestroyConnection(conn);
+        return;
+    }
+    conn->response.offset += rc;
+    if (conn->response.offset < conn->response.length) {
+        NGXMGR_UpdateEvents(conn, WXEVENT_OUT);
+    }
+}
 
 /**
  * Process an incoming event from the main event loop.
@@ -240,8 +293,8 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
             ptr += 2; len -= 2;
             if ((l > len) || (*(ptr + l) != '\0')) {
                 WXLog_Error("Protocol error, invalid session action");
-                NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                     protoError, strlen(protoError + 2) + 2);
+                NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                                "Internal Error: invalid message protocol...");
                 return;
             }
             action = ptr;
@@ -252,8 +305,8 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         ptr += 2; len -= 2;
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid profile identifier");
-            NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protoError, strlen(protoError + 2) + 2);
+            NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                                "Internal Error: invalid message protocol...");
             return;
         }
         profile = (NGXMGR_Profile *) WXHash_GetEntry(&(GlobalConfig.profiles),
@@ -261,8 +314,8 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
                                                      WXHash_StrCaseEqualsFn);
         if (profile == NULL) {
             WXLog_Error("Session request for unknown profile '%s'", ptr);
-            NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 configError, strlen(configError + 2) + 2);
+            NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                                "Internal Error: invalid manager config...");
             return;
         }
         l++; ptr += l; len -= l;
@@ -271,8 +324,8 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         ptr += 2; len -= 2;
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid session identifier");
-            NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protoError, strlen(protoError + 2) + 2);
+            NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                                "Internal Error: invalid message protocol...");
             return;
         }
         sessionId = ptr;
@@ -282,8 +335,8 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         ptr += 2; len -= 2;
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid source IP address");
-            NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protoError, strlen(protoError + 2) + 2);
+            NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                                "Internal Error: invalid message protocol...");
             return;
         }
         sourceIpAddr = ptr;
@@ -293,11 +346,12 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         ptr += 2; len -= 2;
         if ((l > len) || (*(ptr + l) != '\0')) {
             WXLog_Error("Protocol error, invalid request information");
-            NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                 protoError, strlen(protoError + 2) + 2);
+            NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
+                                "Internal Error: invalid message protocol...");
             return;
         }
         request = ptr;
+        l++; ptr += l; len -= l;
 
         /* Any trailing elements are ACTION details, ignored for others */
 
@@ -332,33 +386,8 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
                 (profile->processVerify)(profile, conn, request);
             } else {
                 (profile->processAction)(profile, conn, request, action,
-                                         sessionId);
+                                         sessionId, ptr, len);
             }
         }
-
-#if 0
-        /* REMOVE!!! */
-*(conn->request.buffer + 2) = '0';
-        switch (*(conn->request.buffer + 2)) {
-            case '0':
-                NGXMGR_IssueResponse(conn, NGXMGR_SESSION_INVALID, "", 0);
-                break;
-            case 'a':
-                NGXMGR_IssueResponse(conn, NGXMGR_SESSION_CONTINUE, "", 0);
-                break;
-            case 'b':
-                NGXMGR_IssueResponse(conn, NGXMGR_EXTERNAL_REDIRECT,
-                                     "https://heisz.org", 17);
-                break;
-            case 'c':
-                NGXMGR_IssueResponse(conn, NGXMGR_CONTENT_RESPONSE,
-                                     dataContent, strlen(dataContent + 4) + 4);
-                break;
-            default:
-                NGXMGR_IssueResponse(conn, NGXMGR_ERROR_RESPONSE,
-                                     errContent, strlen(errContent + 4) + 4);
-                break;
-        }
-#endif
     }
 }
