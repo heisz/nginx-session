@@ -7,6 +7,7 @@
  */
 #include "stdconfig.h"
 #include <stddef.h>
+#include <ctype.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
 #include <zlib.h>
@@ -25,6 +26,101 @@
 #define DEF_MEM_LEVEL MAX_MEM_LEVEL
 #endif
 #endif
+
+/* Maybe move this to the toolkit someday */
+static void uriDecode(uint8_t *src) {
+    uint8_t h, l, *dst = src;
+
+    while (*src != '\0') {
+        if ((*src == '%') &&
+                isxdigit(h = *(src + 1)) && isxdigit(l = *(src + 2))) {
+            if (h > 'a') h = h - 'a' + 10;
+            else if (h > 'A') h = h - 'A' + 10;
+            else h = h - '0';
+
+            if (l > 'a') l = l - 'a' + 10;
+            else if (l > 'A') l = l - 'A' + 10;
+            else l = l - '0';
+
+            *(dst++) = (h << 4) | l;
+            src += 3;
+        } else {
+           *(dst++) = *(src++);
+        }
+    }
+    *dst = '\0';
+}
+
+/* Cleanup methods for the following parser */
+static int flushHashCB(WXHashTable *table, void *key, void *data,
+                       void *userData) {
+    /* In this case, the key and data are in the same buffer */
+    WXFree(key);
+    return 0;
+}
+static void freeEncodedData(WXHashTable *table) {
+    WXHash_Scan(table, flushHashCB, NULL);
+    WXHash_Destroy(table);
+}
+
+/**
+ * Utility method to split and reformat URL-encoded form data into a hashtable
+ * of values.
+ *
+ * @param hash The hashtable to populate with form values.
+ * @param data The URL-encoded form data.
+ * @param len The length of the form data.
+ * @return TRUE if parse was successful, FALSE on memory error.
+ */
+static int parseFormEncoded(WXHashTable *table, char *data, int len) {
+    char *ptr = data, *str, *chunk, *old;
+    int l = len, ll;
+
+    /* Outer loop splits on the ampersand */
+    while (len > 0) {
+        /* Find next separator, bounded by length */
+        str = ptr;
+        while (l > 0) {
+            if (*str == '&') break;
+            str++; l--;
+        }
+
+        /* Allocate copy, used to contain both key and value */
+        ll = str - ptr;
+        chunk = WXMalloc(ll + 1);
+        if (chunk == NULL) {
+            WXHash_Destroy(table);
+            return FALSE;
+        }
+        (void) memcpy(chunk, ptr, ll);
+        chunk[ll++] = '\0';
+        ptr += ll; len -= ll;
+
+        /* Split by equals, then condense the key and value in place */
+        str = chunk;
+        while (*str != '\0') {
+            if (*str == '=') {
+                *(str++) = '\0';
+                break;
+            }
+            str++;
+        }
+        uriDecode((uint8_t *) chunk);
+        uriDecode((uint8_t *) str);
+
+        /* And insert into hash, replacing existing values */
+        if (!WXHash_PutEntry(table, chunk, str, (void **) &old, NULL,
+                             WXHash_StrHashFn,
+                             WXHash_StrEqualsFn)) {
+            WXHash_Destroy(table);
+            WXFree(chunk);
+            return FALSE;
+        }
+        if (old != NULL) WXFree(old);
+    }
+
+    return TRUE;
+}
 
 /****** SAML authentication ******/
 
@@ -108,8 +204,8 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
 
 
 /* Verify processing method for the SAML profile, establish new session */
-static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
-                                char *request) {
+static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
+                              char *request) {
     char *url, *enc, *sessReqId, xmlBuff[1024], *deflateBuff, tmBuff[64];
     SAMLProfile *profile = (SAMLProfile *) prf;
     WXMLNamespace *samlNs, *samlpNs, authNs;
@@ -120,6 +216,9 @@ static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     BUF_MEM *bptr;
     time_t now;
     int zrc;
+
+    /* Initialize this up front for cleanup */
+    WXBuffer_InitLocal(&buffer, xmlBuff, sizeof(xmlBuff));
 
     /* TODO - Allocate a pending session instance */
     sessReqId = "TEST_123456";
@@ -184,8 +283,8 @@ static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                              profile->entityId, TRUE) == NULL) goto memfail;
 
     /* Following the spec, compact serialize the XML... */
-    WXBuffer_InitLocal(&buffer, xmlBuff, sizeof(xmlBuff));
     if (WXML_Encode(&buffer, authnReqElmnt, FALSE) == NULL) goto memfail;
+    WXML_Destroy(authnReqElmnt); authnReqElmnt = NULL;
 
     /* TODO - remove this when things are stable */
     WXLog_Debug("SAML Auth Request: %s", buffer.buffer);
@@ -226,6 +325,7 @@ static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     BIO_write(base64Enc, deflateBuff, deflateStrm.total_out);
     BIO_flush(base64Enc);
     BIO_get_mem_ptr(base64Enc, &bptr);
+    WXFree(deflateBuff); deflateBuff = NULL;
 
     /* Finally, generate and issue the encoded URL redirect/request instance */
     WXBuffer_Empty(&buffer);
@@ -238,22 +338,106 @@ static void (SAMLProcessVerify)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     NGXMGR_IssueResponse(conn, NGXMGR_EXTERNAL_REDIRECT,
                          buffer.buffer, buffer.length);
     BIO_free_all(base64Enc);
+    WXBuffer_Destroy(&buffer);
+
     return;
 
 memfail:
+    if (authnReqElmnt != NULL) WXML_Destroy(authnReqElmnt);
     if (base64Enc != NULL) BIO_free_all(base64Enc);
+    if (deflateBuff != NULL) WXFree(deflateBuff);
+    WXBuffer_Destroy(&buffer);
     WXLog_Error("Memory allocation failure!");
     NGXMGR_IssueErrorResponse(conn, 500, "Memory Error",
                        "Internal Error: Manager memory allocation error");
 }
 
-/* Process SAML commands, establish completion or logout */
-static void (SAMLProcessAction)(NGXMGR_Profile *prf, NGXModuleConnection *conn,
-                                char *request, char *action, char *sessionId,
-                                char *data, int dataLen) {
+static void logXML(WXMLElement *root) {
+    WXBuffer buffer;
+
+    WXBuffer_Init(&buffer, 1024);
+    WXML_Encode(&buffer, root, TRUE);
+    WXLog_Debug("XML:\n%s", buffer.buffer);
+    WXBuffer_Destroy(&buffer);
+}
+
+/* Process SAML commands, establish login completion or logout */
+static void SAMLLogin(NGXMGR_Profile *profile, NGXModuleConnection *conn,
+                      char *data, int dataLen) {
+    char *samlResp, *decSamlResp = NULL, errorMsg[1024];
+    BIO *base64Dec, *base64Buff = NULL;
+    WXMLElement *root = NULL;
+    WXHashTable table;
+    int len;
+
+    /* Decode the form arguments */
+    if ((!WXHash_InitTable(&table, 16)) ||
+            (!parseFormEncoded(&table, data, dataLen))) goto memfail;
+
+    /* Pull the saml response, prep for decoding */
+    samlResp = WXHash_GetEntry(&table, "SAMLResponse",
+                               WXHash_StrHashFn, WXHash_StrEqualsFn);
+    if (samlResp == NULL) {
+        NGXMGR_IssueErrorResponse(conn, 500, "Invalid SAML Response",
+                          "Verify response missing SAMLResponse data element");
+        return;
+    }
+    len = strlen(samlResp);
+    decSamlResp = WXMalloc(len + 2);
+    if (decSamlResp == NULL) goto memfail;
+
+    /* It's base64 encoded XML content */
+    base64Buff = BIO_new_mem_buf(samlResp, strlen(samlResp));
+    base64Dec = BIO_new(BIO_f_base64());
+    if ((base64Buff == NULL) || (base64Dec == NULL)) goto memfail;
+    base64Buff = BIO_push(base64Dec, base64Buff);
+    BIO_set_flags(base64Buff, BIO_FLAGS_BASE64_NO_NL);
+    len = BIO_read(base64Buff, decSamlResp, len);
+    decSamlResp[len] = '\0';
+
+    root = WXML_Decode(decSamlResp, errorMsg, sizeof(errorMsg));
+    WXFree(decSamlResp); decSamlResp = NULL;
+    BIO_free_all(base64Buff); base64Buff = NULL;
+    if (root == NULL) {
+        WXLog_Error("Invalid SAML XML response: %s", errorMsg);
+        NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Response",
+                          "Unable to parse XML content of SAML response");
+        WXHash_Destroy(&table);
+        return;
+    }
+
+    logXML(root);
+
     /* Bogus for now! */
     NGXMGR_IssueErrorResponse(conn, 500, "It's an error!",
                               "Test '%s' %d", "test", 12);
+
+    /* Cleanup */
+    freeEncodedData(&table);
+    WXML_Destroy(root);
+
+    return;
+
+memfail:
+    WXLog_Error("Memory allocation failure!");
+    if (table.entries != NULL) freeEncodedData(&table);
+    if (base64Buff != NULL) BIO_free_all(base64Buff);
+    if (decSamlResp != NULL) WXFree(decSamlResp);
+    if (root != NULL) WXML_Destroy(root);
+    NGXMGR_IssueErrorResponse(conn, 500, "Memory Error",
+                       "Internal Error: Manager memory allocation error");
+}
+
+static void SAMLProcessAction(NGXMGR_Profile *prof, NGXModuleConnection *conn,
+                              char *request, char *action, char *sessionId,
+                              char *data, int dataLen) {
+    if ((strcmp(action, "login") == 0) && (strncmp(request, "PST", 3) == 0)) {
+        SAMLLogin(prof, conn, data, dataLen);
+    } else {
+        WXLog_Error("Unrecognized action/request: %s - %s", action, request);
+        NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Configuration",
+                          "Invalid SAML configuration and/or response");
+    }
 }
 
 static NGXMGR_Profile SAMLBaseProfile = {
