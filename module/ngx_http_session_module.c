@@ -11,7 +11,11 @@
 #include "ngx_http_session_module.h"
 #include "messages.h"
 
-/* Forward declaration of the segregated request handlers */
+/* Forward declaration of the directive handlers */
+static char *ngx_http_session_set_bitmask(ngx_conf_t *cf, ngx_command_t *cmd,
+                                          void *conf);
+static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
+                                             void *conf);
 static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
                                        void *conf);
 static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -24,6 +28,17 @@ static char *ngx_http_session_status(ngx_conf_t *cf, ngx_command_t *cmd,
 /* For convenience below */
 #define NGX_HTTP_GLOBAL_CONF \
             NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
+
+/* Bitmask set for OAuth-based session settings */
+/* Note that NGX_CONF_BITMASK_SET is set to 0x01 */
+#define NGX_HTTP_OAUTH_HEADER 0x00000002
+#define NGX_HTTP_OAUTH_QUERY  0x00000004
+
+static ngx_conf_bitmask_t  ngx_http_session_oauth_masks[] = {
+    { ngx_string("header"), NGX_HTTP_OAUTH_HEADER },
+    { ngx_string("query"), NGX_HTTP_OAUTH_QUERY },
+    { ngx_null_string, 0 }
+};
 
 /**
  * Definition of the configuration directives for the module.  Did experiment
@@ -92,22 +107,36 @@ static ngx_command_t ngx_http_session_commands[] = {
     { ngx_string("session_cookie"),
       NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      offsetof(ngx_http_session_loc_conf_t, cookie_id),
-      0, NULL},
-
-    { ngx_string("session_oauth"),
-      NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET, 
-      offsetof(ngx_http_session_loc_conf_t, oauth_enabled),
+      offsetof(ngx_http_session_loc_conf_t, cookie_name),
       NULL},
 
-    { ngx_string("session_property"),
+    { ngx_string("session_parameter"),
       NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET, 
-      offsetof(ngx_http_session_loc_conf_t, session_property),
+      offsetof(ngx_http_session_loc_conf_t, parameter_name),
       NULL},
+
+    { ngx_string("session_bearer"),
+      NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_ANY,
+      ngx_http_session_set_bitmask,
+      NGX_HTTP_LOC_CONF_OFFSET, 
+      offsetof(ngx_http_session_loc_conf_t, bearer_mode),
+      &ngx_http_session_oauth_masks},
+
+    { ngx_string("session_oauth"),
+      NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_ANY,
+      ngx_http_session_set_bitmask,
+      NGX_HTTP_LOC_CONF_OFFSET, 
+      offsetof(ngx_http_session_loc_conf_t, oauth_mode),
+      &ngx_http_session_oauth_masks},
+
+    { ngx_string("session_form_parameter"),
+      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_NOARGS | NGX_CONF_TAKE1,
+      ngx_http_session_form_parameter,
+      NGX_HTTP_LOC_CONF_OFFSET, 
+      0, NULL},
 
     /* Status command for debugging interface */
     { ngx_string("session_status"),
@@ -170,21 +199,38 @@ static void *ngx_http_session_create_loc_conf(ngx_conf_t *cf) {
     // conf->profile_name = { 0, NULL };
     // conf->valid_redirect_target = { 0, NULL };
     // conf->invalid_redirect_target = { 0, NULL };
-    // conf->cookie_id = { 0, NULL };
-    conf->oauth_enabled = NGX_CONF_UNSET;
-    // conf->session_property = { 0, NULL };
+    // conf->cookie_name = { 0, NULL };
+    // conf->parameter_name = { 0, NULL };
+    // conf->bearer_mode = 0;
+    // conf->oauth_mode = 0;
 
     return conf;
 }
 
 /* Odd case, no way to merge strings with NULL using standard ngx defines */
-#define ngx_conf_merge_str(conf, prev)             \
-    if (conf.data == NULL) {                       \
-        if (prev.data != NULL) {                   \
-            conf.len = prev.len;                   \
-            conf.data = prev.data;                 \
-        }                                          \
+#define ngx_conf_merge_str(conf, prev)     \
+    if (conf.data == NULL) {               \
+        if (prev.data != NULL) {           \
+            conf.len = prev.len;           \
+            conf.data = prev.data;         \
+        }                                  \
     }
+
+/* Maybe it's just me, but the standard bitmask handling is messed up too */
+static char *ngx_http_session_set_bitmask(ngx_conf_t *cf, ngx_command_t *cmd,
+                                          void *conf) {
+    ngx_uint_t *np = (ngx_uint_t *) (((char *) conf) + cmd->offset);
+    char *err = ngx_conf_set_bitmask_slot(cf, cmd, conf);
+    if (err != NULL) return err;
+
+    /* This is the weird part, why doesn't the core method set this if set? */
+    *np |= NGX_CONF_BITMASK_SET;
+
+    return NGX_CONF_OK;
+}
+
+#define ngx_conf_merge_bitmask(conf, prev) \
+    if (conf == 0) conf = prev;
 
 /**
  * Matching method to merge between multiple location definitions, apparently
@@ -238,11 +284,10 @@ static char *ngx_http_session_merge_loc_conf(ngx_conf_t *cf,
                        prev->valid_redirect_target);
     ngx_conf_merge_str(conf->invalid_redirect_target,
                        prev->invalid_redirect_target);
-    ngx_conf_merge_str_value(conf->cookie_id,
-                             prev->cookie_id, "sid");
-    ngx_conf_merge_value(conf->oauth_enabled, prev->oauth_enabled, NGX_FALSE);
-    ngx_conf_merge_str_value(conf->session_property,
-                             prev->session_property, "sid");
+    ngx_conf_merge_str(conf->cookie_name, prev->cookie_name);
+    ngx_conf_merge_str(conf->parameter_name, prev->parameter_name);
+    ngx_conf_merge_bitmask(conf->bearer_mode, prev->bearer_mode);
+    ngx_conf_merge_bitmask(conf->oauth_mode, prev->oauth_mode);
 
     return NGX_CONF_OK;
 }
@@ -303,6 +348,110 @@ static const char *get_method_name(ngx_int_t method) {
     return "UNK";
 }
 
+/* Used in several places */
+static ngx_str_t access_token_str = ngx_string("access_token");
+static ngx_str_t oauth_token_str = ngx_string("oauth_token");
+
+static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
+                                             void *conf) {
+    if (cf->args->nelts > 1) {
+    } else {
+    }
+
+    return NGX_CONF_OK;
+}
+
+/* This is less than optimal if multiple parameters enabled so don't do that! */
+static void ngx_http_session_find_param(ngx_http_request_t *req,
+                                        ngx_str_t *name, ngx_str_t *val) {
+    u_char *ptr = req->args.data;
+    u_char *last = ptr + req->args.len;
+    u_char *amp, *eq;
+
+    for (; ptr < last; ptr++) {
+        /* Break out the parameter boundaries (& and =) */
+        amp = ngx_strlchr(ptr, last, '&');
+        if (amp == NULL) {
+            amp = last;
+        }
+        eq = ngx_strlchr(ptr, last, '=');
+        if ((eq == NULL) || (eq > amp)) {
+            eq = amp;
+        }
+
+        /* This assumes the key is never encoded, don't do that either... */
+        if (((eq - ptr) == (int) name->len) &&
+                (ngx_strncmp(ptr, name->data, name->len) == 0)) {
+            val->data = eq + 1;
+            val->len = amp - eq;
+            val->data = ngx_pstrdup(req->pool, val);
+            if (val->data == NULL) val->len = 0;
+            if (val->len != 0) {
+                ptr = last = val->data;
+                ngx_unescape_uri(&last, &ptr, val->len, NGX_UNESCAPE_URI);
+                val->len = last - val->data;
+            }
+            return;
+        }
+
+        ptr = amp;
+    }
+}
+
+/* Common method to parse OAuth Authorization tokens from headers */
+static void ngx_http_session_parse_oauth(ngx_http_request_t *req,
+                                         ngx_int_t is_v1, ngx_str_t *val) {
+    static ngx_str_t bearer = ngx_string("Bearer ");
+    static ngx_str_t oauth = ngx_string("OAuth ");
+    ngx_str_t *auth_scheme = (is_v1) ? &oauth : &bearer;
+    ngx_str_t auth;
+    u_char *ptr;
+
+    /* Quick exit if not of desired scheme, otherwise skip over scheme/space */
+    if (req->headers_in.authorization == NULL) return;
+    auth = req->headers_in.authorization->value;
+    if ((auth.len < auth_scheme->len) ||
+            (ngx_strncasecmp(auth.data, auth_scheme->data,
+                             auth_scheme->len) != 0)) return;
+    auth.data += auth_scheme->len;
+    auth.len -= auth_scheme->len;
+
+    while ((auth.len > 0) && isspace(auth.data[0])) {
+        auth.data++;
+        auth.len--;
+    }
+
+    /* For OAuth V2 Bearer scheme, remainder is the token */
+    if (!is_v1) {
+        /* Note: no whitespace trim, request must be well formed */
+        val->data = ngx_pstrdup(req->pool, &auth);
+        val->len = auth.len;
+        if (val->data == NULL) val->len = 0;
+        return;
+    }
+
+    /* For OAuth V1, support parameterized and bearer form */
+    if (ngx_strnstr(auth.data, "=\"", auth.len) == NULL) {
+        /* Note: no futher test/trim, request must be well formed */
+        val->data = ngx_pstrdup(req->pool, &auth);
+        val->len = auth.len;
+        if (val->data == NULL) val->len = 0;
+        return;
+    }
+
+    /* Note that we just grab valid formatted token, no other validation */
+    if ((ptr = ngx_strnstr(auth.data, "oauth_token=\"", auth.len)) != NULL) {
+        auth.len -= (ptr - auth.data) + 13;
+        auth.data = ptr + 13;
+
+        if ((ptr = ngx_strlchr(auth.data, auth.data + auth.len, '"')) != NULL) {
+            val->len = auth.len = ptr - auth.data;
+            val->data = ngx_pstrdup(req->pool, &auth);
+            if (val->data == NULL) val->len = 0;
+        }
+    }
+}
+
 /**
  * Request handler for session redirect/verify bound request handling, pulling
  * and verifying session information and then redirecting appropriately.
@@ -327,14 +476,38 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     }
 
     /* Based on configuration, determine the inbound session identifier */
+    /* Note that it might already be available from the rewrite phase TODO */
     ngx_memzero(&session_id, sizeof(session_id));
-    if (slcf->cookie_id.len != 0) {
+    if (slcf->cookie_name.len != 0) {
         /* Actually don't really care about the index, just the value */
         la = ngx_http_parse_multi_header_lines(&(req->headers_in.cookies),
-                                               &(slcf->cookie_id), &session_id);
+                                               &(slcf->cookie_name),
+                                               &session_id);
     }
-    if ((session_id.len == 0) && (slcf->oauth_enabled)) {
-        /* TODO - validate req->headers_in.authorization->value for OAuth */
+    if ((session_id.len == 0) && (slcf->parameter_name.len != 0)) {
+        ngx_http_session_find_param(req, &(slcf->parameter_name), &session_id);
+    }
+    if ((session_id.len == 0) && (slcf->bearer_mode != 0)) {
+        if (((slcf->bearer_mode & NGX_HTTP_OAUTH_HEADER) != 0) ||
+                (slcf->bearer_mode == NGX_CONF_BITMASK_SET)) {
+            ngx_http_session_parse_oauth(req, NGX_FALSE, &session_id);
+        }
+        if ((session_id.len == 0) &&
+                (((slcf->bearer_mode & NGX_HTTP_OAUTH_QUERY) != 0) ||
+                     (slcf->bearer_mode == NGX_CONF_BITMASK_SET))) {
+            ngx_http_session_find_param(req, &access_token_str, &session_id);
+        }
+    }
+    if ((session_id.len == 0) && (slcf->oauth_mode != 0)) {
+        if (((slcf->oauth_mode & NGX_HTTP_OAUTH_HEADER) != 0) ||
+                (slcf->oauth_mode == NGX_CONF_BITMASK_SET)) {
+            ngx_http_session_parse_oauth(req, NGX_TRUE, &session_id);
+        }
+        if ((session_id.len == 0) &&
+                (((slcf->oauth_mode & NGX_HTTP_OAUTH_QUERY) != 0) ||
+                     (slcf->oauth_mode == NGX_CONF_BITMASK_SET))) {
+            ngx_http_session_find_param(req, &oauth_token_str, &session_id);
+        }
     }
 
     /* Create the associated context for tracking the verification request */
@@ -448,6 +621,10 @@ static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
  * Parsing method for the session_verify directive.  Registers/binds to
  * the upstream instance and registers the session request handler for
  * incoming requests to this location.
+ *
+ * Configuration syntax:
+ *    session_verify <upstream> <success> [<fail>]
+ *    (if fail is missing generates unauthorized condition)
  *
  * @param cf The module/location configuration instance reference.
  * @param cmd Reference to the original directives for the module.

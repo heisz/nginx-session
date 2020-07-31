@@ -27,9 +27,10 @@ typedef struct {
     ngx_int_t sess_req;
 
     /* Tags/flags for session instance determination and passing */
-    ngx_str_t cookie_id;
-    ngx_flag_t oauth_enabled;
-    ngx_str_t session_property;
+    ngx_str_t cookie_name;
+    ngx_str_t parameter_name;
+    ngx_uint_t oauth_mode;
+    ngx_uint_t bearer_mode;
 
     /* Associated profile definition in the manager for session management */
     ngx_str_t profile_name;
