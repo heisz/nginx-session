@@ -31,6 +31,8 @@ typedef struct {
     ngx_str_t parameter_name;
     ngx_uint_t oauth_mode;
     ngx_uint_t bearer_mode;
+    ngx_str_t form_param_name;
+    ngx_int_t form_param_enabled;
 
     /* Associated profile definition in the manager for session management */
     ngx_str_t profile_name;

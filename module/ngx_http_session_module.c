@@ -88,61 +88,62 @@ static ngx_command_t ngx_http_session_commands[] = {
     { ngx_string("session_redirect"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE3 | NGX_CONF_TAKE4,
       ngx_http_session_redirect,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       0, NULL},
 
     { ngx_string("session_verify"),
-      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE3 | NGX_CONF_TAKE4, 
+      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE3 | NGX_CONF_TAKE4,
       ngx_http_session_verify,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       0, NULL},
 
     { ngx_string("session_action"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE3,
       ngx_http_session_action,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       0, NULL},
 
     /* Associated settings for session management elements */
     { ngx_string("session_cookie"),
       NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_session_loc_conf_t, cookie_name),
       NULL},
 
     { ngx_string("session_parameter"),
       NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_session_loc_conf_t, parameter_name),
       NULL},
 
     { ngx_string("session_bearer"),
       NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_ANY,
       ngx_http_session_set_bitmask,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_session_loc_conf_t, bearer_mode),
       &ngx_http_session_oauth_masks},
 
     { ngx_string("session_oauth"),
       NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_ANY,
       ngx_http_session_set_bitmask,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_session_loc_conf_t, oauth_mode),
       &ngx_http_session_oauth_masks},
 
     { ngx_string("session_form_parameter"),
-      NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_NOARGS | NGX_CONF_TAKE1,
+      NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF |
+                     NGX_CONF_NOARGS | NGX_CONF_TAKE1,
       ngx_http_session_form_parameter,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       0, NULL},
 
     /* Status command for debugging interface */
     { ngx_string("session_status"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
       ngx_http_session_status,
-      NGX_HTTP_LOC_CONF_OFFSET, 
+      NGX_HTTP_LOC_CONF_OFFSET,
       0, NULL},
 
     ngx_null_command
@@ -166,9 +167,7 @@ static void *ngx_http_session_create_loc_conf(ngx_conf_t *cf) {
 
     /* Allocate the object */
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_session_loc_conf_t));
-    if (conf == NULL) {
-        return NGX_CONF_ERROR;
-    }
+    if (conf == NULL) return NGX_CONF_ERROR;
 
     /* This is the set of default upstream options from the memcached module */
     conf->manager.local = NGX_CONF_UNSET_PTR;
@@ -203,12 +202,14 @@ static void *ngx_http_session_create_loc_conf(ngx_conf_t *cf) {
     // conf->parameter_name = { 0, NULL };
     // conf->bearer_mode = 0;
     // conf->oauth_mode = 0;
+    // conf->form_param_name = { 0, NULL };
+    conf->form_param_enabled = NGX_CONF_UNSET;
 
     return conf;
 }
 
 /* Odd case, no way to merge strings with NULL using standard ngx defines */
-#define ngx_conf_merge_str(conf, prev)     \
+#define ngx_sess_conf_merge_str(conf, prev)     \
     if (conf.data == NULL) {               \
         if (prev.data != NULL) {           \
             conf.len = prev.len;           \
@@ -229,7 +230,7 @@ static char *ngx_http_session_set_bitmask(ngx_conf_t *cf, ngx_command_t *cmd,
     return NGX_CONF_OK;
 }
 
-#define ngx_conf_merge_bitmask(conf, prev) \
+#define ngx_sess_conf_merge_bitmask(conf, prev) \
     if (conf == 0) conf = prev;
 
 /**
@@ -278,25 +279,308 @@ static char *ngx_http_session_merge_loc_conf(ngx_conf_t *cf,
     }
 
     /* Also merge the local settings as appropriate */
-    ngx_conf_merge_str(conf->action, prev->action);
-    ngx_conf_merge_str(conf->profile_name, prev->profile_name);
-    ngx_conf_merge_str(conf->valid_redirect_target,
-                       prev->valid_redirect_target);
-    ngx_conf_merge_str(conf->invalid_redirect_target,
-                       prev->invalid_redirect_target);
-    ngx_conf_merge_str(conf->cookie_name, prev->cookie_name);
-    ngx_conf_merge_str(conf->parameter_name, prev->parameter_name);
-    ngx_conf_merge_bitmask(conf->bearer_mode, prev->bearer_mode);
-    ngx_conf_merge_bitmask(conf->oauth_mode, prev->oauth_mode);
+    ngx_sess_conf_merge_str(conf->action, prev->action);
+    ngx_sess_conf_merge_str(conf->profile_name, prev->profile_name);
+    ngx_sess_conf_merge_str(conf->valid_redirect_target,
+                            prev->valid_redirect_target);
+    ngx_sess_conf_merge_str(conf->invalid_redirect_target,
+                            prev->invalid_redirect_target);
+    ngx_sess_conf_merge_str(conf->cookie_name, prev->cookie_name);
+    ngx_sess_conf_merge_str(conf->parameter_name, prev->parameter_name);
+    ngx_sess_conf_merge_bitmask(conf->bearer_mode, prev->bearer_mode);
+    ngx_sess_conf_merge_bitmask(conf->oauth_mode, prev->oauth_mode);
+    ngx_sess_conf_merge_str(conf->form_param_name, prev->form_param_name);
+    ngx_conf_merge_value(conf->form_param_enabled, prev->form_param_enabled,
+                         NGX_CONF_UNSET);
+
+    return NGX_CONF_OK;
+}
+
+/* Used in several places */
+static ngx_str_t access_token_str = ngx_string("access_token");
+static ngx_str_t oauth_token_str = ngx_string("oauth_token");
+
+/* Internal structure to track form completion and pass session data */
+typedef struct {
+    /* Tracking elements for the body content handler */
+    ngx_int_t waiting;
+    ngx_int_t finished;
+
+    /* Return information for form parameter information */
+    char *id_src;
+    ngx_str_t session_id;
+} ngx_http_session_form_ctx_t;
+
+/* This is the maximum name/content length for session id parameter */
+#define MAX_PARAM_LEN 2048
+
+/* Common common method to extract/decode target query/form parameter */
+static int ngx_http_session_extract_val(ngx_http_request_t *req,
+                                        u_char *pos, u_char *eq, u_char *last,
+                                        ngx_str_t *name, ngx_str_t *val) {
+    /* This assumes the key is never encoded (so don't do that!) */
+    if (((eq - pos) == (int) name->len) &&
+            (ngx_strncmp(pos, name->data, name->len) == 0)) {
+        val->data = eq + 1;
+        val->len = last - val->data;
+        val->data = ngx_pstrdup(req->pool, val);
+        if (val->data == NULL) val->len = 0;
+        if (val->len != 0) {
+            pos = last = val->data;
+            ngx_unescape_uri(&last, &pos, val->len, NGX_UNESCAPE_URI);
+            val->len = last - val->data;
+        }
+
+        return NGX_TRUE;
+    }
+
+    return NGX_FALSE;
+}
+
+/* Common method for testing/handling the three classes of form parameters */
+static void ngx_http_session_parse_form_param(ngx_http_request_t *req,
+                                              ngx_http_session_loc_conf_t *slcf,
+                                              ngx_http_session_form_ctx_t *fctx,
+                                              u_char *pos, u_char *last) {
+    u_char *eq;
+    if ((last == pos) || ((eq = ngx_strlchr(pos, last, '=')) == NULL)) return;
+
+    if (slcf->form_param_name.len != 0) {
+        fctx->id_src = "explicit form parameter";
+        if (ngx_http_session_extract_val(req, pos, eq, last,
+                                         &(slcf->form_param_name),
+                                         &(fctx->session_id))) return;
+    }
+
+    if (slcf->form_param_enabled != NGX_CONF_UNSET) {
+        if (slcf->parameter_name.len != 0) {
+            fctx->id_src = "named query form parameter";
+            if (ngx_http_session_extract_val(req, pos, eq, last,
+                                             &(slcf->parameter_name),
+                                             &(fctx->session_id))) return;
+        }
+        if (slcf->bearer_mode != 0) {
+            fctx->id_src = "oauth bearer form parameter";
+            if (ngx_http_session_extract_val(req, pos, eq, last,
+                                             &access_token_str,
+                                             &(fctx->session_id))) return;
+        }
+	if (slcf->oauth_mode != 0) {
+            fctx->id_src = "oauthv1 form parameter";
+            if (ngx_http_session_extract_val(req, pos, eq, last,
+                                             &oauth_token_str,
+                                             &(fctx->session_id))) return;
+	}
+    }
+}
+
+/* End-of-body processor for reading form parameters */
+static void ngx_http_session_post_read(ngx_http_request_t *req) {
+    ngx_http_session_loc_conf_t *slcf =
+                 ngx_http_get_module_loc_conf(req, ngx_http_session_module);
+    ngx_http_session_form_ctx_t *fctx =
+                 ngx_http_get_module_ctx(req, ngx_http_session_module);
+    u_char buff[MAX_PARAM_LEN], *pos, *amp;
+    ngx_int_t buff_len = 0, len;
+    ngx_chain_t *cl;
+    ngx_buf_t *buf;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                   "*** session manager: post read complete - %s",
+                   ((fctx->waiting) ? "waiting" : "initial request"));
+
+    /* Mark finished so handler can exit */
+    fctx->finished = 1;
+
+    /* I dunno what this is about but nginx locks up without it... */
+    req->main->count--;
+
+    /* Parse the session identifier from the form content (hopefully) */
+    if ((req->request_body != NULL) && (req->request_body->bufs != NULL)) {
+        for (cl = req->request_body->bufs; cl != NULL; cl = cl->next) {
+            buf = cl->buf;
+            if (buf->in_file) {
+                /* TODO - support this someday, if possible... */
+                ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                               "*** session manager: file buffer encountered");
+                break;
+            }
+
+            /* Churn on ampersand separator, could be fragments in buffer */
+            pos = buf->pos;
+            while ((amp = ngx_strlchr(pos, buf->last, '&')) != NULL) {
+                len = amp - pos;
+                if (buff_len + len > MAX_PARAM_LEN) {
+                    /* Overflow (but at end), just discard */
+                    buff_len = 0;
+                } else {
+                    ngx_memcpy(buff + buff_len, pos, len);
+                    buff_len += len;
+                    ngx_http_session_parse_form_param(req, slcf, fctx, buff,
+                                                      buff + buff_len);
+                    if (fctx->session_id.len != 0) break;
+                    buff_len = 0;
+                }
+
+                /* Continue inside current buffer */
+                pos = amp + 1;
+            }
+            if (fctx->session_id.len != 0) break;
+
+            /* Retain leftovers, unless overflow */
+            len = buf->last - pos;
+            if (buff_len + len > MAX_PARAM_LEN) {
+                /* Discard, but leave buffer overflowed to avoid use */
+                buff_len = MAX_PARAM_LEN + 1;
+            } else if (len > 0) {
+                ngx_memcpy(buff + buff_len, pos, len);
+                buff_len += len;
+            }
+
+            /* Perhaps that's the end of the chain */
+            if ((buff_len != 0) && (buff_len <= MAX_PARAM_LEN) &&
+                    (cl->next == NULL)) {
+                ngx_http_session_parse_form_param(req, slcf, fctx, buff,
+                                                  buff + buff_len);
+                buff_len = 0;
+            }
+
+            if (fctx->session_id.len != 0) break;
+        }
+    }
+
+    /* If we were in a wait state, clear flag and re-enter the processing */
+    if (fctx->waiting) {
+        fctx->waiting = NGX_FALSE;
+        ngx_http_core_run_phases(req);
+    }
+}
+
+/* The rewrite handler executes everywhere, fast exit if not location enabled */
+static ngx_int_t ngx_http_session_rewrite_handler(ngx_http_request_t *req) {
+    static ngx_str_t enc_type = ngx_string("application/x-www-form-urlencoded");
+    ngx_http_session_loc_conf_t *slcf;
+    ngx_http_session_form_ctx_t *fctx;
+    ngx_int_t rc;
+
+    /* If there is a context, we are in the form read cycle, finish! */
+    fctx = ngx_http_get_module_ctx(req, ngx_http_session_module);
+    if (fctx != NULL) {
+        /* Wait or continue basd on completion state */
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                       "*** session manager: reentered rewrite handler - %s",
+                       ((fctx->finished) ? "finished" : "incomplete"));
+        return (fctx->finished) ? NGX_DECLINED : NGX_DONE;
+    }
+
+    /* Immediate exit if rewrite not needed specifically for this location */
+    slcf = ngx_http_get_module_loc_conf(req, ngx_http_session_module);
+    if ((slcf == NULL) ||
+            ((slcf->form_param_name.len == 0) && (!slcf->form_param_enabled))) {
+        /* Just pass it on to the next handler */
+        return NGX_DECLINED;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                   "*** session manager: location enabled rewrite handling");
+
+    /* Or if it's not actually a form request */
+    if ((req->method != NGX_HTTP_POST) && (req->method != NGX_HTTP_PUT)) {
+        return NGX_DECLINED;
+    }
+    if ((req->headers_in.content_type == NULL) ||
+           (req->headers_in.content_type->value.data == NULL)) {
+        return NGX_DECLINED;
+    }
+    if ((req->headers_in.content_type->value.len != enc_type.len) ||
+            (ngx_strncasecmp(req->headers_in.content_type->value.data,
+                             enc_type.data, enc_type.len) != 0)) {
+        return NGX_DECLINED;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                   "*** session manager: reading client body for post params");
+
+    /* Set up for form body reading (handy of pcalloc to clear the flags) */
+    fctx = ngx_pcalloc(req->pool, sizeof(ngx_http_session_form_ctx_t));
+    if (fctx == NULL) return NGX_ERROR;
+    ngx_http_set_ctx(req, fctx, ngx_http_session_module);
+
+    /* Read the body and pass along to the next handler when done */
+    rc = ngx_http_read_client_request_body(req, ngx_http_session_post_read);
+    if ((rc == NGX_ERROR) || (rc >= NGX_HTTP_SPECIAL_RESPONSE)) return rc;
+    if (rc == NGX_AGAIN) {
+        /* Not done yet, signal continued form content read */
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                       "*** session manager: entering wait state for body");
+        fctx->waiting = NGX_TRUE;
+        return NGX_DONE;
+    }
+
+    return NGX_DECLINED;
+}
+
+/* Internal option to globally enable rewrite handler for form input handling */
+typedef struct {
+    ngx_uint_t form_param_needed;
+} ngx_http_session_main_conf_t;
+
+static ngx_int_t ngx_http_session_main_init(ngx_conf_t *cf) {
+    ngx_http_session_main_conf_t *smcf;
+    ngx_http_core_main_conf_t *cmcf;
+    ngx_http_handler_pt *h;
+
+    /* Do nothing if configuration has not been requested anywhere */
+    smcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_session_module);
+    if (!smcf->form_param_needed) return NGX_OK;
+
+    /* Otherwise, register our rewrite handler */
+    /* Note that this applies globally if any location requests it */
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+    if (h == NULL) return NGX_ERROR;
+    *h = ngx_http_session_rewrite_handler;
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                   "*** session manager: registered rewrite handler (forms)");
+
+    return NGX_OK;
+}
+
+static void *ngx_http_session_create_main_conf(ngx_conf_t *cf) {
+    /* Note that form_param_needed is automatically zeroed by pcalloc */
+    return ngx_pcalloc(cf->pool, sizeof(ngx_http_session_main_conf_t));
+}
+
+static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
+                                             void *conf) {
+    ngx_str_t *values = (ngx_str_t *) cf->args->elts;
+    ngx_http_session_loc_conf_t *slcf = conf;
+    ngx_http_session_main_conf_t *smcf;
+
+    /* Parse mode of form parameter support (direct or implied) */
+    if (cf->args->nelts > 1) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "*** session manager: form parameter %.*s",
+                       values[1].len, values[1].data);
+        slcf->form_param_name = values[1];
+    } else {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "*** session manager: form parameter (generic)");
+        slcf->form_param_enabled = NGX_TRUE;
+    }
+
+    /* Force rewrite handler registration in main configuration completion */
+    smcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_session_module);
+    smcf->form_param_needed = NGX_TRUE;
 
     return NGX_CONF_OK;
 }
 
 /* The module context, provides methods for module definition/configuration */
 static ngx_http_module_t ngx_http_session_module_ctx = {
-    NULL, NULL,
-    NULL, NULL,
-    NULL, NULL,
+    NULL,
+    ngx_http_session_main_init, ngx_http_session_create_main_conf,
+    NULL, NULL, NULL,
     ngx_http_session_create_loc_conf, ngx_http_session_merge_loc_conf
 };
 
@@ -348,19 +632,6 @@ static const char *get_method_name(ngx_int_t method) {
     return "UNK";
 }
 
-/* Used in several places */
-static ngx_str_t access_token_str = ngx_string("access_token");
-static ngx_str_t oauth_token_str = ngx_string("oauth_token");
-
-static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
-                                             void *conf) {
-    if (cf->args->nelts > 1) {
-    } else {
-    }
-
-    return NGX_CONF_OK;
-}
-
 /* This is less than optimal if multiple parameters enabled so don't do that! */
 static void ngx_http_session_find_param(ngx_http_request_t *req,
                                         ngx_str_t *name, ngx_str_t *val) {
@@ -374,24 +645,11 @@ static void ngx_http_session_find_param(ngx_http_request_t *req,
         if (amp == NULL) {
             amp = last;
         }
-        eq = ngx_strlchr(ptr, last, '=');
-        if ((eq == NULL) || (eq > amp)) {
-            eq = amp;
-        }
 
-        /* This assumes the key is never encoded, don't do that either... */
-        if (((eq - ptr) == (int) name->len) &&
-                (ngx_strncmp(ptr, name->data, name->len) == 0)) {
-            val->data = eq + 1;
-            val->len = amp - eq;
-            val->data = ngx_pstrdup(req->pool, val);
-            if (val->data == NULL) val->len = 0;
-            if (val->len != 0) {
-                ptr = last = val->data;
-                ngx_unescape_uri(&last, &ptr, val->len, NGX_UNESCAPE_URI);
-                val->len = last - val->data;
-            }
-            return;
+        eq = ngx_strlchr(ptr, amp, '=');
+        if (eq != NULL) {
+            if (ngx_http_session_extract_val(req, ptr, eq, last,
+                                             name, val)) return;
         }
 
         ptr = amp;
@@ -462,59 +720,76 @@ static void ngx_http_session_parse_oauth(ngx_http_request_t *req,
 static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     ngx_http_session_loc_conf_t *slcf;
     ngx_http_session_request_ctx_t *ctx;
+    ngx_http_session_form_ctx_t *fctx;
     ngx_int_t la, lb, lc, ld, le;
     ngx_str_t session_id;
+    char *id_src = "n/a";
     uint8_t *ptr;
 
     /* Need our original configuration for processing */
     slcf = ngx_http_get_module_loc_conf(req, ngx_http_session_module);
 
-    /* This shouldn't happen (request reset) but just in case... */
-    ctx = ngx_http_get_module_ctx(req, ngx_http_session_module);
-    if (ctx != NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    /* If there is a form context, it may contain our session identifier */
+    ngx_memzero(&session_id, sizeof(session_id));
+    fctx = ngx_http_get_module_ctx(req, ngx_http_session_module);
+    if ((fctx != NULL) && (fctx->session_id.len != 0)) {
+        id_src = fctx->id_src;
+        session_id = fctx->session_id;
     }
 
     /* Based on configuration, determine the inbound session identifier */
-    /* Note that it might already be available from the rewrite phase TODO */
-    ngx_memzero(&session_id, sizeof(session_id));
-    if (slcf->cookie_name.len != 0) {
+    /* Of course, this presumes that the parameter wasn't pulled from post */
+    if ((session_id.len == 0) && (slcf->cookie_name.len != 0)) {
         /* Actually don't really care about the index, just the value */
         la = ngx_http_parse_multi_header_lines(&(req->headers_in.cookies),
                                                &(slcf->cookie_name),
                                                &session_id);
+        id_src = "cookie";
     }
     if ((session_id.len == 0) && (slcf->parameter_name.len != 0)) {
         ngx_http_session_find_param(req, &(slcf->parameter_name), &session_id);
+        id_src = "query parameter";
     }
     if ((session_id.len == 0) && (slcf->bearer_mode != 0)) {
         if (((slcf->bearer_mode & NGX_HTTP_OAUTH_HEADER) != 0) ||
                 (slcf->bearer_mode == NGX_CONF_BITMASK_SET)) {
             ngx_http_session_parse_oauth(req, NGX_FALSE, &session_id);
+            id_src = "oauth bearer authorization";
         }
         if ((session_id.len == 0) &&
                 (((slcf->bearer_mode & NGX_HTTP_OAUTH_QUERY) != 0) ||
                      (slcf->bearer_mode == NGX_CONF_BITMASK_SET))) {
             ngx_http_session_find_param(req, &access_token_str, &session_id);
+            id_src = "oauth bearer query parameter";
         }
     }
     if ((session_id.len == 0) && (slcf->oauth_mode != 0)) {
         if (((slcf->oauth_mode & NGX_HTTP_OAUTH_HEADER) != 0) ||
                 (slcf->oauth_mode == NGX_CONF_BITMASK_SET)) {
             ngx_http_session_parse_oauth(req, NGX_TRUE, &session_id);
+            id_src = "oauthv1 authorization";
         }
         if ((session_id.len == 0) &&
                 (((slcf->oauth_mode & NGX_HTTP_OAUTH_QUERY) != 0) ||
                      (slcf->oauth_mode == NGX_CONF_BITMASK_SET))) {
             ngx_http_session_find_param(req, &oauth_token_str, &session_id);
+            id_src = "oauthv1 query parameter";
         }
+    }
+
+    /* Log enough to know it, but not be a security violation */
+    if (session_id.len != 0) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                       "*** session manager: found session id: len %d, from %s",
+                       (int) session_id.len, id_src);
+    } else {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                       "*** session manager: no session id found");
     }
 
     /* Create the associated context for tracking the verification request */
     ctx = ngx_pcalloc(req->pool, sizeof(ngx_http_session_request_ctx_t));
-    if (ctx == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    if (ctx == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
     /* TODO - possible short-cut cache for local redirect/verify? */
 
