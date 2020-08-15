@@ -10,6 +10,8 @@
 #include <ctype.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
 #include <zlib.h>
 #include "manager.h"
 #include "json.h"
@@ -26,6 +28,11 @@
 #define DEF_MEM_LEVEL MAX_MEM_LEVEL
 #endif
 #endif
+
+/* These are not defined in manager.h to avoid h-infection */
+WXMLLinkedElement *WXML_ValidateSignedReferences(WXMLElement *doc,
+                                                 EVP_PKEY *key);
+void WXML_FreeLinkedElements(WXMLLinkedElement *list);
 
 /* Maybe move this to the toolkit someday */
 static void uriDecode(uint8_t *src) {
@@ -134,6 +141,7 @@ typedef struct {
 
     /* Required configuration elements */
     char *signOnURL;
+    char *idpEntityId;
 
     /* Optional elements depending on IdP and validation requirements */
     char *entityId;
@@ -141,6 +149,10 @@ typedef struct {
     char *destination;
     int forceAuthn;
     int isPassive;
+    char *encodedCert;
+
+    /* Derived elements from configuration */
+    X509 *idpCertificate;
 } SAMLProfile;
 
 /**
@@ -149,6 +161,8 @@ typedef struct {
 static WXJSONBindDefn samlBindings[] = {
     { "signOnURL", WXJSONBIND_STR,
       offsetof(SAMLProfile, signOnURL), TRUE },
+    { "idpEntityId", WXJSONBIND_STR,
+      offsetof(SAMLProfile, idpEntityId), TRUE },
 
     { "entityId", WXJSONBIND_STR,
       offsetof(SAMLProfile, entityId), FALSE },
@@ -159,7 +173,9 @@ static WXJSONBindDefn samlBindings[] = {
     { "forceAuthn", WXJSONBIND_BOOLEAN,
       offsetof(SAMLProfile, forceAuthn), FALSE },
     { "isPassive", WXJSONBIND_BOOLEAN,
-      offsetof(SAMLProfile, isPassive), FALSE }
+      offsetof(SAMLProfile, isPassive), FALSE },
+    { "idpCertificate", WXJSONBIND_STR,
+      offsetof(SAMLProfile, encodedCert), FALSE }
 };
 
 #define SAML_CFG_COUNT (sizeof(samlBindings) / sizeof(WXJSONBindDefn))
@@ -172,6 +188,8 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
                                 WXJSONValue *config) {
     SAMLProfile *retval = (SAMLProfile *) orig;
     char errMsg[1024];
+    BIO *bio;
+    size_t l;
 
     /* First call will not provide a value */
     if (retval == NULL) {
@@ -184,11 +202,16 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
 
         /* Pre-initialize the configuration details/defaults */
         retval->signOnURL = NULL;
+        retval->idpEntityId = NULL;
+
         retval->entityId = NULL;
         retval->providerName = NULL;
         retval->destination = NULL;
         retval->forceAuthn = FALSE;
         retval->isPassive = FALSE;
+        retval->encodedCert = FALSE;
+
+        retval->idpCertificate = NULL;
     }
 
     /* Bind the configuration data */
@@ -199,9 +222,40 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         return NULL;
     }
 
+    /* Post-process the validation certificate, if provided */
+    if (retval->idpCertificate != NULL) {
+        X509_free(retval->idpCertificate);
+        retval->idpCertificate = NULL;
+    }
+    if ((retval->encodedCert != NULL) &&
+            ((l = strlen(retval->encodedCert)) != 0)) {
+        bio = BIO_new(BIO_s_mem());
+        if ((bio == NULL) || (BIO_write(bio, retval->encodedCert, l) != l)) {
+            WXLog_Error("Memory failure allocating certificate content");
+            if (bio != NULL) BIO_free_all(bio);
+            return NULL;
+        }
+
+        retval->idpCertificate = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        BIO_free_all(bio);
+        if (retval->idpCertificate == NULL) {
+            WXLog_Error("Failed to parse X509 PEM encoded certificate");
+            return NULL;
+        }
+
+        WXLog_Debug("Loaded IdP Certificate for %s",
+                    X509_NAME_oneline(X509_get_subject_name(
+                                               retval->idpCertificate),
+                                      errMsg, sizeof(errMsg)));
+    } else {
+        WXLog_Warn("\n\nWARNING: No IdP validation certificate provided!!!!\n"
+          "This exposes your SAML SP to injection replay attacks, and should\n"
+          "ONLY be enabled under emergency conditions where the validation\n"
+          "code is failing unexpectedly (and maybe not even then).\n");
+    }
+
     return &(retval->base);
 }
-
 
 /* Verify processing method for the SAML profile, establish new session */
 static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
@@ -277,17 +331,22 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                                    profile->signOnURL,
                                    TRUE) == NULL) goto memfail;
     }
-    /* TODO - Assertion consumer URL */
 
-    if (WXML_AllocateElement(authnReqElmnt, "Issuer", samlNs,
-                             profile->entityId, TRUE) == NULL) goto memfail;
+    /* TODO - Assertion consumer URL? */
+
+    /* This is optional in config but often required */
+    if (profile->entityId != NULL) {
+        if (WXML_AllocateElement(authnReqElmnt, "Issuer", samlNs,
+                                 profile->entityId, TRUE) == NULL) goto memfail;
+    }
+
+    /* TODO - name ID policy for AllowCreate support? */
+
+    /* Authn document is now complete */
 
     /* Following the spec, compact serialize the XML... */
     if (WXML_Encode(&buffer, authnReqElmnt, FALSE) == NULL) goto memfail;
     WXML_Destroy(authnReqElmnt); authnReqElmnt = NULL;
-
-    /* TODO - remove this when things are stable */
-    WXLog_Debug("SAML Auth Request: %s", buffer.buffer);
 
     /* Note: encoding includes the null terminator (string), remove it */
     buffer.length--;
@@ -327,6 +386,8 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     BIO_get_mem_ptr(base64Enc, &bptr);
     WXFree(deflateBuff); deflateBuff = NULL;
 
+    /* TODO - RelayState determination? */
+
     /* Finally, generate and issue the encoded URL redirect/request instance */
     WXBuffer_Empty(&buffer);
     if ((WXBuffer_Append(&buffer, profile->signOnURL,
@@ -335,6 +396,7 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             (WXURL_EscapeURI(&buffer, bptr->data,
                              bptr->length) == NULL)) goto memfail;
 
+    /* Tally ho! */
     NGXMGR_IssueResponse(conn, NGXMGR_EXTERNAL_REDIRECT,
                          buffer.buffer, buffer.length);
     BIO_free_all(base64Enc);
@@ -362,20 +424,22 @@ static void logXML(WXMLElement *root) {
 }
 
 /* Process SAML commands, establish login completion or logout */
-static void SAMLLogin(NGXMGR_Profile *profile, NGXModuleConnection *conn,
+static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                       char *data, int dataLen) {
     char *samlResp, *decSamlResp = NULL, errorMsg[1024];
+    SAMLProfile *profile = (SAMLProfile *) prf;
+    WXMLLinkedElement *signedRefs = NULL;
     BIO *base64Dec, *base64Buff = NULL;
     WXMLElement *root = NULL;
-    WXHashTable table;
+    WXHashTable postData;
     int len;
 
     /* Decode the form arguments */
-    if ((!WXHash_InitTable(&table, 16)) ||
-            (!parseFormEncoded(&table, data, dataLen))) goto memfail;
+    if ((!WXHash_InitTable(&postData, 16)) ||
+            (!parseFormEncoded(&postData, data, dataLen))) goto memfail;
 
     /* Pull the saml response, prep for decoding */
-    samlResp = WXHash_GetEntry(&table, "SAMLResponse",
+    samlResp = WXHash_GetEntry(&postData, "SAMLResponse",
                                WXHash_StrHashFn, WXHash_StrEqualsFn);
     if (samlResp == NULL) {
         NGXMGR_IssueErrorResponse(conn, 500, "Invalid SAML Response",
@@ -387,40 +451,55 @@ static void SAMLLogin(NGXMGR_Profile *profile, NGXModuleConnection *conn,
     if (decSamlResp == NULL) goto memfail;
 
     /* It's base64 encoded XML content */
-    base64Buff = BIO_new_mem_buf(samlResp, strlen(samlResp));
+    base64Buff = BIO_new_mem_buf(samlResp, len);
     base64Dec = BIO_new(BIO_f_base64());
     if ((base64Buff == NULL) || (base64Dec == NULL)) goto memfail;
     base64Buff = BIO_push(base64Dec, base64Buff);
     BIO_set_flags(base64Buff, BIO_FLAGS_BASE64_NO_NL);
     len = BIO_read(base64Buff, decSamlResp, len);
     decSamlResp[len] = '\0';
-
-    root = WXML_Decode(decSamlResp, errorMsg, sizeof(errorMsg));
-    WXFree(decSamlResp); decSamlResp = NULL;
     BIO_free_all(base64Buff); base64Buff = NULL;
+
+    root = WXML_Decode(decSamlResp, TRUE, errorMsg, sizeof(errorMsg));
+    WXFree(decSamlResp); decSamlResp = NULL;
     if (root == NULL) {
         WXLog_Error("Invalid SAML XML response: %s", errorMsg);
         NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Response",
                           "Unable to parse XML content of SAML response");
-        WXHash_Destroy(&table);
+        WXHash_Destroy(&postData);
         return;
     }
 
+    /* TODO -remove when stable */
     logXML(root);
+
+    /* First, determine the validated references up front (if enabled) */
+    if (profile->idpCertificate != NULL) {
+        signedRefs = WXML_ValidateSignedReferences(root,
+                                  X509_get_pubkey(profile->idpCertificate));
+        if (signedRefs == NULL) {
+            /* Either internal error or bad signatures, invalid response */
+            NGXMGR_IssueErrorResponse(conn, 401, "Unauthorized (SAML)",
+                        "Invalid signed SAML response or error in processing");
+            WXHash_Destroy(&postData);
+            return;
+        }
+    }
 
     /* Bogus for now! */
     NGXMGR_IssueErrorResponse(conn, 500, "It's an error!",
                               "Test '%s' %d", "test", 12);
 
     /* Cleanup */
-    freeEncodedData(&table);
+    if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
+    freeEncodedData(&postData);
     WXML_Destroy(root);
 
     return;
 
 memfail:
     WXLog_Error("Memory allocation failure!");
-    if (table.entries != NULL) freeEncodedData(&table);
+    if (postData.entries != NULL) freeEncodedData(&postData);
     if (base64Buff != NULL) BIO_free_all(base64Buff);
     if (decSamlResp != NULL) WXFree(decSamlResp);
     if (root != NULL) WXML_Destroy(root);

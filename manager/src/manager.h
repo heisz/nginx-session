@@ -103,4 +103,10 @@ struct NGXMGR_Profile {
 /* Exposed allocation method for creating profiles instances from config */
 NGXMGR_Profile *NGXMGR_AllocProfile(char *profileName, WXJSONValue *config);
 
+/* Structure for tracking element lists, for processing and return */
+typedef struct WXMLLinkedElement {
+    struct WXMLElement *elmnt;
+    struct WXMLLinkedElement *nextElmnt;
+} WXMLLinkedElement;
+
 #endif
