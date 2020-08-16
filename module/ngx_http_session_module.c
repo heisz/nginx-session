@@ -560,7 +560,7 @@ static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
     /* Parse mode of form parameter support (direct or implied) */
     if (cf->args->nelts > 1) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                       "*** session manager: form parameter %.*s",
+                       "*** session manager: form parameter %*s",
                        values[1].len, values[1].data);
         slcf->form_param_name = values[1];
     } else {
@@ -854,7 +854,7 @@ static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
     ngx_url_t url;
 
     ngx_log_debug4(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                   "*** session manager: redirect for %.*s [to %.*s]",
+                   "*** session manager: redirect for %*s [to %*s]",
                    values[1].len, values[1].data,
                    values[2].len, values[2].data);
 
@@ -914,7 +914,7 @@ static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
     ngx_url_t url;
 
     ngx_log_debug6(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                   "*** session manager: verify for %.*s:%.*s [to %.*s]",
+                   "*** session manager: verify for %*s:%*s [to %*s]",
                    values[1].len, values[1].data,
                    values[2].len, values[2].data,
                    values[3].len, values[3].data);
@@ -971,7 +971,7 @@ static char *ngx_http_session_action(ngx_conf_t *cf, ngx_command_t *cmd,
     ngx_url_t url;
 
     ngx_log_debug6(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                   "*** session manager: action for %.*s:%.*s [%.*s]",
+                   "*** session manager: action for %*s:%*s [%*s]",
                    values[1].len, values[1].data,
                    values[2].len, values[2].data,
                    values[3].len, values[3].data);
@@ -1022,7 +1022,7 @@ static char *ngx_http_session_status(ngx_conf_t *cf, ngx_command_t *cmd,
     ngx_url_t url;
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                   "*** session status: enabled for %.*s",
+                   "*** session status: enabled for %*s",
                    values[1].len, values[1].data);
 
     /* This directive can only be used once (non-merging) */
