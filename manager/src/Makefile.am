@@ -18,7 +18,7 @@ AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
               @MYSQL_INCLUDE@ @PGSQL_INCLUDE@ \
               -DSYSCONF_DIR='"$(sysconfdir)"'
 
-ngxsessmgr_SOURCES = manager.c requests.c profiles.c \
+ngxsessmgr_SOURCES = manager.c requests.c profiles.c xmlsig.c \
                   ../toolkit/src/db/dbxf.c \
                   ../toolkit/src/lang/encoding.c \
                   ../toolkit/src/lang/json.c \
