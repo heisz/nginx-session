@@ -1,6 +1,6 @@
 /**
  * Primary NGINX session management daemon entry point.
- * 
+ *
  * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
@@ -29,7 +29,7 @@ void daemonStop();
  * Standard usage/version methods.
  */
 static void usage(int errorCode) {
-    (void) fprintf(stderr, 
+    (void) fprintf(stderr,
         "Usage: manager [options]\n\n"
         "Options:\n"
         "    -c <file> - read configuration from <file>\n"
@@ -48,37 +48,74 @@ static void version() {
     exit(0);
 }
 
-/* For lack of a better location, capture global configuration here */
+/* For lack of a better location, capture global config or objects here */
 #ifndef SYSCONF_DIR
 #define SYSCONF_DIR "."
 #endif
 static char *configFileName = SYSCONF_DIR "/ngxsessmgr.cfg";
 
-GlobalConfigType GlobalConfig = {
-   /* svcBindAddr = */ NULL /* any */,
-   /* svcBindService = */ NULL /* 5344 */,
-   /* initialServerPoolSize = */ 1024,
-   /* eventPollLimit = */ 1024,
-   /* sessionLogFileName = */ NULL,
+static WXThreadPool workerThreadPool;
+static WXHashTable authProfiles;
 
-   /* ---- */
+NGXMGRGlobalDataType GlobalData = {
+    /* svcBindAddr = */ NULL /* any */,
+    /* svcBindService = */ NULL /* 5344 */,
+    /* initialEventPoolSize = */ 1024,
+    /* eventPollLimit = */ 1024,
+    /* minThreadPoolWorkers = */ 2,
+    /* maxThreadPoolWorkers = */ 8,
 
-   /* sessionLogFile = */ NULL,
-   /* profiles = */ {0, 0, 0, NULL},
-   /* shutdownRequested = */ 0
+    /* dataSourceName = */ NULL,
+    /* dbUser = */ NULL,
+    /* dbPasswd = */ NULL,
+
+    /* sessionLogFileName = */ NULL,
+
+    /* sessionIdLen = */ 64,
+    /* sessionLifespan = */ 300,
+    /* sessionIPLocked = */ FALSE,
+
+    /* ---- */
+
+    /* workerThreadPool = */ &workerThreadPool,
+    /* dbConnPool = */ NULL,
+    /* sessionLogFile = */ NULL,
+    /* profiles = */ &authProfiles,
+    /* shutdownRequested = */ 0
 };
 
 static WXJSONBindDefn cfgBindings[] = {
     { "service.bindAddress", WXJSONBIND_STR,
-      offsetof(GlobalConfigType, svcBindAddr), FALSE },
+      offsetof(NGXMGRGlobalDataType, svcBindAddr), FALSE },
     { "service.bindPort", WXJSONBIND_STR,
-      offsetof(GlobalConfigType, svcBindService), FALSE },
-    { "eventloop.poolSize", WXJSONBIND_SIZE,
-      offsetof(GlobalConfigType, initialServerPoolSize), FALSE },
-    { "eventloop.pollSize", WXJSONBIND_SIZE,
-      offsetof(GlobalConfigType, eventPollLimit), FALSE },
+      offsetof(NGXMGRGlobalDataType, svcBindService), FALSE },
+
+    { "system.eventloop.poolSize", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, initialEventPoolSize), FALSE },
+    { "system.eventloop.pollSize", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, eventPollLimit), FALSE },
+
+    { "system.threadpool.minWorkers", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, minThreadPoolWorkers), FALSE },
+    { "system.threadpool.maxWorkers", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, maxThreadPoolWorkers), FALSE },
+
+    { "database.dsn", WXJSONBIND_STR,
+      offsetof(NGXMGRGlobalDataType, dataSourceName), FALSE },
+    { "database.user", WXJSONBIND_STR,
+      offsetof(NGXMGRGlobalDataType, dbUser), FALSE },
+    { "database.password", WXJSONBIND_STR,
+      offsetof(NGXMGRGlobalDataType, dbPasswd), FALSE },
+
+    { "session.idLength", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, sessionIdLen), FALSE },
+    { "session.lifespan", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, sessionLifespan), FALSE },
+    { "session.ipLocked", WXJSONBIND_BOOLEAN,
+      offsetof(NGXMGRGlobalDataType, sessionIPLocked), FALSE },
+
     { "sessionLogFile", WXJSONBIND_STR,
-      offsetof(GlobalConfigType, sessionLogFileName), FALSE }
+      offsetof(NGXMGRGlobalDataType, sessionLogFileName), FALSE }
 };
 
 #define CFG_COUNT (sizeof(cfgBindings) / sizeof(WXJSONBindDefn))
@@ -90,10 +127,10 @@ static int profileParse(WXHashTable *table, void *key, void *object,
     NGXMGR_Profile *profile;
 
     /* Find existing entry for reload, otherwise init */
-    if (GlobalConfig.profiles.entries == NULL) {
-        (void) WXHash_InitTable(&(GlobalConfig.profiles), 64);
+    if (GlobalData.profiles->entries == NULL) {
+        (void) WXHash_InitTable(GlobalData.profiles, 64);
     }
-    profile = (NGXMGR_Profile *) WXHash_GetEntry(&(GlobalConfig.profiles),
+    profile = (NGXMGR_Profile *) WXHash_GetEntry(GlobalData.profiles,
                                                  key, WXHash_StrCaseHashFn,
                                                  WXHash_StrCaseEqualsFn);
     if (profile != NULL) {
@@ -102,7 +139,7 @@ static int profileParse(WXHashTable *table, void *key, void *object,
     } else {
         profile = NGXMGR_AllocProfile((char *) key, config);
         if (profile != NULL) {
-            if (!WXHash_InsertEntry(&(GlobalConfig.profiles),
+            if (!WXHash_InsertEntry(GlobalData.profiles,
                                     (void *) profile->name, profile,
                                     NULL, NULL, WXHash_StrCaseHashFn,
                                     WXHash_StrCaseEqualsFn)) {
@@ -121,7 +158,7 @@ static int profileParse(WXHashTable *table, void *key, void *object,
  * Core function to load (or reload) the configuration information for the
  * manager, from the command line specified configuration file.
  */
-static void parseConfiguration() {
+static void parseConfiguration(int isReload) {
     char *ptr, *str, errMsg[1024];
     WXJSONValue *config, *profiles;
     WXBuffer fileContent;
@@ -182,7 +219,7 @@ static void parseConfiguration() {
     }
     WXBuffer_Destroy(&fileContent);
 
-    if (!WXJSON_Bind(config, &GlobalConfig, cfgBindings, CFG_COUNT,
+    if (!WXJSON_Bind(config, &GlobalData, cfgBindings, CFG_COUNT,
                      errMsg, sizeof(errMsg))) {
         WXLog_Error("Configuration binding error: %s", errMsg);
         WXJSON_Destroy(config);
@@ -190,14 +227,14 @@ static void parseConfiguration() {
     }
 
     /* Reset logging */
-    if (GlobalConfig.sessionLogFile != NULL) {
-        (void) fclose(GlobalConfig.sessionLogFile);
-        GlobalConfig.sessionLogFile = NULL;
+    if (GlobalData.sessionLogFile != NULL) {
+        (void) fclose(GlobalData.sessionLogFile);
+        GlobalData.sessionLogFile = NULL;
     }
-    if (GlobalConfig.sessionLogFileName != NULL) {
-        GlobalConfig.sessionLogFile =
-                         fopen(GlobalConfig.sessionLogFileName, "a");
-        if (GlobalConfig.sessionLogFile == NULL) {
+    if (GlobalData.sessionLogFileName != NULL) {
+        GlobalData.sessionLogFile =
+                         fopen(GlobalData.sessionLogFileName, "a");
+        if (GlobalData.sessionLogFile == NULL) {
             WXLog_Error("Unable to open logging file: %s", strerror(errno));
         }
     }
@@ -211,6 +248,17 @@ static void parseConfiguration() {
     }
 
     WXJSON_Destroy(config);
+
+    /* Handle post configuration limit changes */
+    if (isReload) {
+        /* The pool should automatically adjust to match */
+        (void) WXThread_MutexLock(&(GlobalData.workerThreadPool->mutex));
+        GlobalData.workerThreadPool->minWorkers =
+                                GlobalData.minThreadPoolWorkers;
+        GlobalData.workerThreadPool->maxWorkers =
+                                GlobalData.maxThreadPoolWorkers;
+        (void) WXThread_MutexUnlock(&(GlobalData.workerThreadPool->mutex));
+    }
 }
 
 /* Handle signals according to daemon operations */
@@ -218,13 +266,13 @@ void coreSignalHandler(int sig) {
     /* All good things must come to an end... */
     if ((sig == SIGINT) || (sig == SIGTERM)) {
         WXLog_Info("NGINX session manager process exiting...");
-        GlobalConfig.shutdownRequested = TRUE;
+        GlobalData.shutdownRequested = TRUE;
     }
 
     /* Reconfiguration signal... */
     if (sig == SIGHUP) {
         WXLog_Info("NGINX session manager reloading configuration...");
-        parseConfiguration();
+        parseConfiguration(TRUE);
     }
 }
 
@@ -268,7 +316,7 @@ int main(int argc, char **argv) {
     }
 
     /* Parse initial configuration details, merge command options */
-    parseConfiguration();
+    parseConfiguration(FALSE);
 
     /* Switch to a daemon, unless indicated otherwise */
     if (daemonMode) {
@@ -285,13 +333,13 @@ int main(int argc, char **argv) {
                BUILDLABEL);
 
     /* Open the bind socket, must be exclusive access */
-    svc = (GlobalConfig.svcBindService == NULL) ? "5344" :
-                                                  GlobalConfig.svcBindService;
+    svc = (GlobalData.svcBindService == NULL) ? "5344" :
+                                                  GlobalData.svcBindService;
     WXLog_Info("Listening on %s:%s for incoming requests",
-               ((GlobalConfig.svcBindAddr == NULL) ? "any" :
-                                                     GlobalConfig.svcBindAddr),
+               ((GlobalData.svcBindAddr == NULL) ? "any" :
+                                                     GlobalData.svcBindAddr),
                svc);
-    if (WXSocket_OpenTCPServer(GlobalConfig.svcBindAddr, svc,
+    if (WXSocket_OpenTCPServer(GlobalData.svcBindAddr, svc,
                                &svcConnectHandle) != WXNRC_OK) {
         WXLog_Error("Failed to open primary bind socket: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
@@ -302,6 +350,47 @@ int main(int argc, char **argv) {
     if (WXSocket_SetNonBlockingState(svcConnectHandle, TRUE) != WXNRC_OK) {
         WXLog_Error("Unable to unblock primary bind socket: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
+        exit(1);
+    }
+
+    /* Open the database connection, if defined */
+    if (GlobalData.dataSourceName == NULL) {
+        WXLog_Info("No database DSN configured, memory managed sessions only!");
+    } else {
+        GlobalData.dbConnPool =
+                  (WXDBConnectionPool *) WXMalloc(sizeof(WXDBConnectionPool));
+        if (GlobalData.dbConnPool == NULL) {
+            WXLog_Error("Unable to allocate DB connection pool instance");
+            exit(1);
+        }
+
+        WXLog_Info("Initializing database connection pool");
+        rc = WXDBConnectionPool_Init(GlobalData.dbConnPool,
+                                     GlobalData.dataSourceName,
+                                     GlobalData.dbUser, GlobalData.dbPasswd, 1);
+
+        if (rc == WXDRC_DB_ERROR) {
+            WXLog_Error("Pool initialization failed: %s",
+                        WXDB_GetLastErrorMessage(GlobalData.dbConnPool));
+            WXLog_Info("Presuming transient data condition, ignoring...");
+        } else if (rc != WXDRC_OK) {
+            WXLog_Error("Internal error creating connection pool: %s",
+                        WXDB_GetLastErrorMessage(GlobalData.dbConnPool));
+            exit(1);
+        }
+    }
+
+    /* With that, initialize the session elements */
+    NGXMGR_InitializeSessions();
+
+    /* Finally, initialize the worker thread pool */
+    WXLog_Info("Worker pool initializing, %lld standby, %lld maximum",
+               (long long int) GlobalData.minThreadPoolWorkers,
+               (long long int) GlobalData.maxThreadPoolWorkers);
+    if (WXThreadPool_Init(GlobalData.workerThreadPool,
+                          GlobalData.minThreadPoolWorkers,
+                          GlobalData.maxThreadPoolWorkers, 30) != WXTRC_OK) {
+        WXLog_Error("Unexpected startup error for worker thread pool");
         exit(1);
     }
 
@@ -362,7 +451,7 @@ static int processRequests(WXSocket svcConnectHandle) {
     int rc;
 
     /* Create the primary event registry, register for binding */
-    if (WXEvent_CreateRegistry(GlobalConfig.initialServerPoolSize,
+    if (WXEvent_CreateRegistry(GlobalData.initialEventPoolSize,
                                &evtRegistry) != WXNRC_OK) {
         WXLog_Error("Failed to create primary event registry: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
@@ -377,7 +466,7 @@ static int processRequests(WXSocket svcConnectHandle) {
     }
 
     /* Allocate the configured event processing buffer */
-    eventBuffer = (WXEvent *) WXMalloc(GlobalConfig.eventPollLimit *
+    eventBuffer = (WXEvent *) WXMalloc(GlobalData.eventPollLimit *
                                        sizeof(WXEvent));
     if (eventBuffer == NULL)
     {
@@ -386,13 +475,13 @@ static int processRequests(WXSocket svcConnectHandle) {
     }
 
     /* Process forever, or at least until a signal tells us to stop */
-    WXLog_Info("Event loop starting, polling %lld slots, %lld pool size",
-               (long long int) GlobalConfig.eventPollLimit,
-               (long long int) GlobalConfig.initialServerPoolSize);
-    while (GlobalConfig.shutdownRequested == 0) {
+    WXLog_Info("Event loop starting, polling %lld slots, %lld init pool size",
+               (long long int) GlobalData.eventPollLimit,
+               (long long int) GlobalData.initialEventPoolSize);
+    while (GlobalData.shutdownRequested == 0) {
         /* Wait for something to happen... */
         evtCnt = WXEvent_Wait(evtRegistry, eventBuffer,
-                              GlobalConfig.eventPollLimit, NULL);
+                              GlobalData.eventPollLimit, NULL);
         if (evtCnt < 0) {
             WXLog_Error("Error in wait on event action (rc %d): %s",
                         (int) evtCnt,

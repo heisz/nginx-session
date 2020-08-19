@@ -18,7 +18,7 @@ AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
               @MYSQL_INCLUDE@ @PGSQL_INCLUDE@ \
               -DSYSCONF_DIR='"$(sysconfdir)"'
 
-ngxsessmgr_SOURCES = manager.c requests.c profiles.c xmlsig.c \
+ngxsessmgr_SOURCES = manager.c requests.c profiles.c xmlsig.c sessions.c \
                   ../toolkit/src/db/dbxf.c \
                   ../toolkit/src/lang/encoding.c \
                   ../toolkit/src/lang/json.c \
@@ -29,9 +29,10 @@ ngxsessmgr_SOURCES = manager.c requests.c profiles.c xmlsig.c \
                   ../toolkit/src/utility/buffer.c \
                   ../toolkit/src/utility/daemon.c \
                   ../toolkit/src/utility/hash.c \
+                  ../toolkit/src/utility/threadpool.c \
+                  ../toolkit/src/utility/thread.c \
                   ../toolkit/src/utility/log.c \
-                  ../toolkit/src/utility/mem.c \
-                  ../toolkit/src/utility/thread.c
+                  ../toolkit/src/utility/mem.c
 
 # What a pain, can't do direct substitution in automake SOURCES
 if INCLUDE_MYSQL_DRV

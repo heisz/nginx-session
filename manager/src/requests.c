@@ -309,7 +309,7 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
                                 "Internal Error: invalid message protocol...");
             return;
         }
-        profile = (NGXMGR_Profile *) WXHash_GetEntry(&(GlobalConfig.profiles),
+        profile = (NGXMGR_Profile *) WXHash_GetEntry(GlobalData.profiles,
                                                      ptr, WXHash_StrCaseHashFn,
                                                      WXHash_StrCaseEqualsFn);
         if (profile == NULL) {
@@ -356,20 +356,19 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         /* Any trailing elements are ACTION details, ignored for others */
 
         /* Validate session up front, so we can log determined state */
-        /* TODO - use profile standards (fixed IP, for example) */
-        /* TODO - actually do it against the internal tables */
+        sessionIsValid = NGXMGR_VerifySessionState(sessionId, sourceIpAddr);
 
         /* Generate session log entry if enabled */
-        if (GlobalConfig.sessionLogFile != NULL) {
+        if (GlobalData.sessionLogFile != NULL) {
             WXLog_GetFormattedTimestamp(timestamp);
 
-            (void) fprintf(GlobalConfig.sessionLogFile,
+            (void) fprintf(GlobalData.sessionLogFile,
                            "%s %s%s%s[%s:%s->%s] %s\n",
                            timestamp, profile->name,
                            ((action != NULL) ? ":" : ""), action,
                            sessionId, sourceIpAddr,
                            ((sessionIsValid) ? "Y" : "N"), request);
-            (void) fflush(GlobalConfig.sessionLogFile);
+            (void) fflush(GlobalData.sessionLogFile);
         }
 
         /* Certain conditions are immediately resolvable */

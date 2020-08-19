@@ -153,7 +153,15 @@ typedef struct {
 
     /* Derived elements from configuration */
     X509 *idpCertificate;
+
+    /* Other profile-specific data (all accessed in event thread) */
+    WXHashTable reqSessions;
 } SAMLProfile;
+
+typedef struct SAMLReqSession {
+    char *reqSessionId;
+    time_t start;
+} SAMLReqSession;
 
 /**
  * Configuration binding definitions to parse the above.
@@ -212,6 +220,12 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         retval->encodedCert = FALSE;
 
         retval->idpCertificate = NULL;
+
+        if (!WXHash_InitTable(&(retval->reqSessions), 64)) {
+            WXLog_Error("Memory failure allocating certificate content");
+            WXFree(retval);
+            return NULL;
+        }
     }
 
     /* Bind the configuration data */
@@ -265,6 +279,7 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     WXMLNamespace *samlNs, *samlpNs, authNs;
     WXMLElement *authnReqElmnt = NULL;
     BIO *base64Enc = NULL, *base64Buff;
+    SAMLReqSession *reqSession = NULL;
     z_stream deflateStrm;
     WXBuffer buffer;
     BUF_MEM *bptr;
@@ -274,8 +289,21 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     /* Initialize this up front for cleanup */
     WXBuffer_InitLocal(&buffer, xmlBuff, sizeof(xmlBuff));
 
-    /* TODO - Allocate a pending session instance */
-    sessReqId = "TEST_123456";
+    /* Allocate and record a pending session instance */
+    /* Note: this is transient and signed, so doesn't need excessive length? */
+    sessReqId = NGXMGR_GenerateSessionId(24);
+    if (sessReqId == NULL) goto memfail;
+    reqSession = (SAMLReqSession *) WXMalloc(sizeof(SAMLReqSession));
+    if (reqSession == NULL) {
+        WXFree(sessReqId);
+        goto memfail;
+    }
+    reqSession->reqSessionId = sessReqId;
+    reqSession->start = time((time_t *) NULL);
+    if (!WXHash_PutEntry(&(profile->reqSessions), sessReqId, reqSession,
+                         NULL, NULL, WXHash_StrHashFn, WXHash_StrEqualsFn)) {
+        goto memfail;
+    }
 
     /* Build the authentication request document based on details and config */
     authNs.prefix = "samlp";
@@ -296,7 +324,7 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     /* First the 'reasonably' fixed attributes */
     if (WXML_AllocateAttribute(authnReqElmnt, "Version", NULL, "2.0", 
                               TRUE) == NULL) goto memfail;
-    if (WXML_AllocateAttribute(authnReqElmnt, "ID", NULL, "sessReqId", 
+    if (WXML_AllocateAttribute(authnReqElmnt, "ID", NULL, sessReqId, 
                                TRUE) == NULL) goto memfail;
     if (WXML_AllocateAttribute(authnReqElmnt, "ProtocolBinding", NULL,
                                "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
@@ -409,6 +437,13 @@ memfail:
     if (base64Enc != NULL) BIO_free_all(base64Enc);
     if (deflateBuff != NULL) WXFree(deflateBuff);
     WXBuffer_Destroy(&buffer);
+    if (reqSession != NULL) {
+        (void) WXHash_RemoveEntry(&(profile->reqSessions),
+                                  reqSession->reqSessionId, NULL, NULL,
+                                  WXHash_StrHashFn, WXHash_StrEqualsFn);
+        WXFree(reqSession->reqSessionId);
+        WXFree(reqSession);
+    }
     WXLog_Error("Memory allocation failure!");
     NGXMGR_IssueErrorResponse(conn, 500, "Memory Error",
                        "Internal Error: Manager memory allocation error");

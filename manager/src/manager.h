@@ -1,6 +1,6 @@
 /**
  * Shared definitions for the session manager elements.
- * 
+ *
  * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
@@ -10,6 +10,8 @@
 
 #include "socket.h"
 #include "event.h"
+#include "threadpool.h"
+#include "dbxf.h"
 #include "json.h"
 #include "buffer.h"
 #include "hash.h"
@@ -26,27 +28,47 @@ typedef struct {
     char *svcBindService;
 
     /* Initial number of server connections in the event pool (default: 1024) */
-    size_t initialServerPoolSize;
+    size_t initialEventPoolSize;
 
     /* Event loop connection polling size (default: 1024) */
     size_t eventPollLimit;
 
+    /* Limits on the worker thread pool for asynchronous event processing 2/8 */
+    size_t minThreadPoolWorkers;
+    size_t maxThreadPoolWorkers;
+
+    /* Access/authentication information for database management */
+    char *dataSourceName;
+    char *dbUser, *dbPasswd;
+
     /* Configuration-driven logging filename */
     char *sessionLogFileName;
 
+    /* Session management options */
+    size_t sessionIdLen;
+    size_t sessionLifespan;
+    int sessionIPLocked;
+
+    /* ---- */
     /* Things below here are not directly bound from configuration */
+
+    /* Worker threading pool for handling asynchronous requests */
+    WXThreadPool *workerThreadPool;
+
+    /* Database connection pool, NULL if no database access is enabled */
+    WXDBConnectionPool *dbConnPool;
 
     /* Access logging file information, NULL indicates no logging */
     FILE *sessionLogFile;
 
     /* Storage element for the profile hash */
-    WXHashTable profiles;
+    WXHashTable *profiles;
 
     /* Just being sneaky, this flag is only controlled by the signaller */
     int shutdownRequested;
-} GlobalConfigType;
+} NGXMGRGlobalDataType;
 
-extern GlobalConfigType GlobalConfig;
+extern NGXMGRGlobalDataType GlobalData;
 
 /*
  * Container element for an instance of a connection from the nginx module.
@@ -103,10 +125,15 @@ struct NGXMGR_Profile {
 /* Exposed allocation method for creating profiles instances from config */
 NGXMGR_Profile *NGXMGR_AllocProfile(char *profileName, WXJSONValue *config);
 
-/* Structure for tracking element lists, for processing and return */
+/* Structure for tracking security element lists, for processing and return */
 typedef struct WXMLLinkedElement {
     struct WXMLElement *elmnt;
     struct WXMLLinkedElement *nextElmnt;
 } WXMLLinkedElement;
+
+/* Batches of methods for managing sessions (finally!) */
+void NGXMGR_InitializeSessions();
+char *NGXMGR_GenerateSessionId(int idlen);
+int NGXMGR_VerifySessionState(char *sessionId, char *sourceIpAddr);
 
 #endif
