@@ -100,12 +100,14 @@ void NGXMGR_IssueResponse(NGXModuleConnection *conn, uint8_t code,
         return;
     }
 #ifdef NGXMGR_TRACE_MSG
-    WXLog_Binary(WXLOG_DEBUG, conn->response.buffer, 0, conn->response.length);
+    WXLog_Binary(WXLOG_DEBUG, conn->response.buffer, conn->response.offset,
+                 conn->response.length - conn->response.offset);
 #endif
 
     /* Attempt a write, resetting flags as required */
-    rc = WXSocket_Send(conn->connectionHandle, conn->response.buffer,
-                       conn->response.length, 0);
+    rc = WXSocket_Send(conn->connectionHandle,
+                       conn->response.buffer + conn->response.offset,
+                       conn->response.length - conn->response.offset, 0);
     if (rc < 0) {
         WXLog_Error("Write error for response: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
@@ -163,12 +165,14 @@ void NGXMGR_IssueErrorResponse(NGXModuleConnection *conn, uint16_t errorCode,
     WXBuffer_Destroy(&buffer);
 
 #ifdef NGXMGR_TRACE_MSG
-    WXLog_Binary(WXLOG_DEBUG, conn->response.buffer, 0, conn->response.length);
+    WXLog_Binary(WXLOG_DEBUG, conn->response.buffer, conn->response.offset,
+                 conn->response.length - conn->response.offset);
 #endif
 
     /* Attempt a write, resetting flags as required */
-    rc = WXSocket_Send(conn->connectionHandle, conn->response.buffer,
-                       conn->response.length, 0);
+    rc = WXSocket_Send(conn->connectionHandle,
+                       conn->response.buffer + conn->response.offset,
+                       conn->response.length - conn->response.offset, 0);
     if (rc < 0) {
         WXLog_Error("Write error for error response: %s",
                     WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
