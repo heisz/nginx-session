@@ -89,6 +89,8 @@ char *NGXMGR_GenerateSessionId(int idlen) {
         *(str--) = encbytes[(datum >> 6) & 0x3F];
         *(str--) = encbytes[datum & 0x3F];
     }
+    /* Thanks Microsoft, make sure first digit is a letter */
+    retval[0] = encbytes[retval[0] % 52];
     retval[idlen] = '\0';
 
     return retval;
