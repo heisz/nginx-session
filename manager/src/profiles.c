@@ -144,12 +144,14 @@ typedef struct {
     char *idpEntityId;
 
     /* Optional elements depending on IdP and validation requirements */
+    char *assertionConsumerURL;
     char *entityId;
     char *providerName;
     char *destination;
     int forceAuthn;
     int isPassive;
     char *encodedCert;
+    int clockSkew;
 
     /* Derived elements from configuration */
     X509 *idpCertificate;
@@ -172,6 +174,8 @@ static WXJSONBindDefn samlBindings[] = {
     { "idpEntityId", WXJSONBIND_STR,
       offsetof(SAMLProfile, idpEntityId), TRUE },
 
+    { "assertionConsumerURL", WXJSONBIND_STR,
+      offsetof(SAMLProfile, assertionConsumerURL), FALSE },
     { "entityId", WXJSONBIND_STR,
       offsetof(SAMLProfile, entityId), FALSE },
     { "providerName", WXJSONBIND_STR,
@@ -183,7 +187,9 @@ static WXJSONBindDefn samlBindings[] = {
     { "isPassive", WXJSONBIND_BOOLEAN,
       offsetof(SAMLProfile, isPassive), FALSE },
     { "idpCertificate", WXJSONBIND_STR,
-      offsetof(SAMLProfile, encodedCert), FALSE }
+      offsetof(SAMLProfile, encodedCert), FALSE },
+    { "clockSkew", WXJSONBIND_INT,
+      offsetof(SAMLProfile, clockSkew), FALSE }
 };
 
 #define SAML_CFG_COUNT (sizeof(samlBindings) / sizeof(WXJSONBindDefn))
@@ -212,12 +218,14 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         retval->signOnURL = NULL;
         retval->idpEntityId = NULL;
 
+        retval->assertionConsumerURL = NULL;
         retval->entityId = NULL;
         retval->providerName = NULL;
         retval->destination = NULL;
         retval->forceAuthn = FALSE;
         retval->isPassive = FALSE;
         retval->encodedCert = FALSE;
+        retval->clockSkew = 0;
 
         retval->idpCertificate = NULL;
 
@@ -458,15 +466,46 @@ static void logXML(WXMLElement *root) {
     WXBuffer_Destroy(&buffer);
 }
 
+/* Standard algorithm for converting civil/Gregorian date to days since epoch */
+static int daysFromCivil(int y, int m, int d) {
+    y -= (m <= 2) ? 1 : 0;
+    int era = ((y >= 0) ? y : (y - 399)) / 400;
+    int yoe = y - era * 400;
+    int doy = (153 * (m + ((m > 2) ? -3 : 9)) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* Parse the round-trip formatted timestamp into epoch time */
+static time_t parseRTT(char *which, char *tmstr) {
+    int dfc;
+
+    /* Only light validation, presume IdP is well behaved */
+    if ((strlen(tmstr) < 20) ||
+            (tmstr[4] != '-') || (tmstr[7] != '-') || (tmstr[10] != 'T') ||
+            (tmstr[13] != ':') || (tmstr[16] != ':') ||
+            (tmstr[strlen(tmstr) - 1] != 'Z')) {
+        WXLog_Warn("Invalid format for %s - '%s'", which, tmstr);
+        return 0;
+    }
+
+    dfc = daysFromCivil(atoi(tmstr), atoi(tmstr + 5), atoi(tmstr + 8));
+    return 60 * (60 * (24L * dfc + atoi(tmstr + 11)) + atoi(tmstr + 14)) +
+           atoi(tmstr + 17);
+}
+
 /* Process SAML commands, establish login completion or logout */
 static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                       char *data, int dataLen) {
-    char *samlResp, *decSamlResp = NULL, errorMsg[1024];
+    WXMLElement *root = NULL, *node, *chld, *prnt, *conf, *val, *attrs, *attv;
+    char *ptr, *samlResp, *decSamlResp = NULL, errorMsg[1024], *nameId;
+    WXMLLinkedElement *signedRefs = NULL, *sref;
     SAMLProfile *profile = (SAMLProfile *) prf;
-    WXMLLinkedElement *signedRefs = NULL;
     BIO *base64Dec, *base64Buff = NULL;
-    WXMLElement *root = NULL;
-    WXHashTable postData;
+    WXHashTable postData, attributes;
+    SAMLReqSession *reqSession;
+    WXMLAttribute *attr;
+    time_t tm;
     int len;
 
     /* Decode the form arguments */
@@ -479,6 +518,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     if (samlResp == NULL) {
         NGXMGR_IssueErrorResponse(conn, 500, "Invalid SAML Response",
                           "Verify response missing SAMLResponse data element");
+        freeEncodedData(&postData);
         return;
     }
     len = strlen(samlResp);
@@ -501,7 +541,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         WXLog_Error("Invalid SAML XML response: %s", errorMsg);
         NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Response",
                           "Unable to parse XML content of SAML response");
-        WXHash_Destroy(&postData);
+        freeEncodedData(&postData);
         return;
     }
 
@@ -514,10 +554,166 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                                   X509_get_pubkey(profile->idpCertificate));
         if (signedRefs == NULL) {
             /* Either internal error or bad signatures, invalid response */
-            NGXMGR_IssueErrorResponse(conn, 401, "Unauthorized (SAML)",
-                        "Invalid signed SAML response or error in processing");
-            WXHash_Destroy(&postData);
-            return;
+            goto samlerr;
+        }
+    }
+
+    /* Validations of response assertions according to SAML spec 4.1.4.2/3 */
+    nameId = NULL;
+    for (node = root->children; node != NULL; node = node->next) {
+        /* Just interested in assertions */
+        if ((node->name == NULL) ||
+                   (strcmp(node->name, "Assertion") != 0)) continue;
+
+        /* If signature verification enabled, assertion must be signed */
+        if (signedRefs != NULL) {
+            prnt = node;
+            while (prnt != NULL) {
+                sref = signedRefs;
+                while (sref != NULL) {
+                    if (sref->elmnt == prnt) break;
+                    sref = sref->nextElmnt;
+                }
+                if (sref != NULL) break;
+                prnt = prnt->parent;
+            }
+
+            if (prnt == NULL) {
+                WXLog_Warn("Unsigned Assertion found, skipping");
+                continue;
+            }
+        }
+
+        /* Per XSD, Assertion must contain Issuer response to entity */
+        if ((chld = WXML_Find(node, "/Issuer", FALSE)) == NULL) {
+            WXLog_Error("Assertion missing Issuer child element");
+            goto samlerr;
+        }
+        attr = WXML_Find(node, "@Format", FALSE);
+        if (attr != NULL) {
+            if ((attr->value == NULL) ||
+                (strcmp(attr->value,
+                    "urn:oasis:names:tc:SAML:2.0:nameid-format:entity") != 0)) {
+                WXLog_Error("Incorrect Issuer Format '%s'", attr->value);
+                goto samlerr;
+            }
+        }
+        if ((chld->content == NULL) ||
+                (strcmp(chld->content, profile->idpEntityId) != 0)) {
+            WXLog_Warn("Assertion for mismatched entity, skipping");
+            continue;
+        }
+
+        /* Find valid Authn->Subject(Confirmation) relation */
+        /* Lots of specific dependencies from 4.1.4.2/4.1.4.3 here */
+        if ((chld = WXML_Find(node, "/AuthnStatement", FALSE)) != NULL) {
+            /* Only consume valid bearer Subject instances */
+            /* This does assume there is only one marked instance */
+            if (((attr = WXML_Find(node, "/Subject/SubjectConfirmation/@Method",
+                                   FALSE)) != NULL) &&
+                    (attr->value != NULL) &&
+                    (strcmp(attr->value,
+                            "urn:oasis:names:tc:SAML:2.0:cm:bearer") == 0)) {
+                conf = WXML_Find(attr->element, "/SubjectConfirmationData",
+                                 FALSE);
+            }
+        }
+        if ((conf != NULL) &&
+                (((attr = WXML_Find(conf, "/@Recipient", FALSE)) == NULL) ||
+                     (attr->value == NULL))) {
+            WXLog_Warn("Assertion Subject missing Recipient, skipping");
+            conf = NULL;
+        }
+        if (conf != NULL) {
+            /* Only validate the acu if it is actually configured */
+            if (profile->assertionConsumerURL != NULL) {
+                if (strcmp(attr->value, profile->assertionConsumerURL) != 0) {
+                    WXLog_Warn("Assertion Subject Recipient mismatch "
+                               "('%s' vs. '%s'), skipping",
+                               attr->value, profile->assertionConsumerURL);
+                    conf = NULL;
+                }
+            }
+        }
+        if ((conf != NULL) &&
+                (((attr = WXML_Find(conf, "/@NotOnOrAfter", FALSE)) == NULL) ||
+                     (attr->value == NULL))) {
+            WXLog_Warn("Assertion Subject missing NotOnOrAfter, skipping");
+            conf = NULL;
+        } else {
+            tm = parseRTT("NotOnOrAfter", attr->value);
+            if (tm == 0) {
+                conf = NULL;
+            } else if (tm < (time((time_t *) NULL) - profile->clockSkew)) {
+                WXLog_Warn("Assertion NotOnOrAfter in past (%d s), skipping",
+                           (int) (time((time_t *) NULL) - tm));
+                conf = NULL;
+            }
+        }
+        if ((conf != NULL) &&
+                (((attr = WXML_Find(conf, "/@InResponseTo", FALSE)) == NULL) ||
+                     (attr->value == NULL))) {
+            WXLog_Warn("Assertion Subject missing InResponseTo, skipping");
+            conf = NULL;
+        } else {
+            reqSession = WXHash_GetEntry(&(profile->reqSessions), attr->value,
+                                         WXHash_StrHashFn, WXHash_StrEqualsFn);
+            if (reqSession == NULL) {
+                WXLog_Warn("Unsolicited or replay Assertion, skipping");
+                conf = NULL;
+            } else {
+                /* TODO - need to track any of the underlying content? */
+                (void) WXHash_RemoveEntry(&(profile->reqSessions), attr->value,
+                                          NULL, NULL, WXHash_StrHashFn,
+                                          WXHash_StrEqualsFn);
+                WXFree(reqSession->reqSessionId);
+                WXFree(reqSession);
+            }
+        }
+        if ((conf != NULL) &&
+                (((val = WXML_Find(node,
+                                   "/Conditions/AudienceRestriction/Audience",
+                                   FALSE)) == NULL) ||
+                     (val->content == NULL))) {
+            WXLog_Warn("Assertion missing Audience, skipping");
+            conf = NULL;
+        } else if ((conf != NULL) && (profile->entityId != NULL)) {
+            if (strcmp(val->content, profile->entityId) != 0) {
+                WXLog_Warn("Assertion Audience/EntityId mismatch "
+                           "('%s' vs '%s'), skipping", val->content,
+                           profile->entityId);
+                conf = NULL;
+            }
+        }
+        /* Other Conditions do not have to be honoured, for now we don't */
+
+        /* If we've passed the validations, extract the nameid */
+        /* Poorly behaving IdP could mess with multiples, oh well */
+        if ((conf != NULL) &&
+                ((val = WXML_Find(conf->parent->parent,
+                                  "/NameID", FALSE)) == NULL) &&
+                (val->content != NULL)) {
+            nameId = val->content;
+            WXLog_Debug("Validated principal assertion for '%s'", nameId);
+
+            /* TODO - grab the optional elements as well */
+            /* AuthnStatement/@SessionIndex */
+            /* AuthnStatement/@SessionNotOnOrAfter */
+        }
+
+        /* Regardless of identity conditions, attributes can be distributed */
+        if ((attrs = WXML_Find(node, "/AttributeStatement", FALSE)) != NULL) {
+            for (chld = attrs->children; chld != NULL; chld = chld->next) {
+                if ((chld->name == NULL) ||
+                        (strcmp(chld->name, "Attribute") != 0)) continue;
+
+                if (((attr = WXML_Find(chld, "/@Name", FALSE)) == NULL) ||
+                        (attr->value == NULL)) continue;
+                if (((attv = WXML_Find(chld, "/AttributeValue",
+                                       FALSE)) == NULL) ||
+                        (attv->content == NULL)) continue;
+fprintf(stderr, "ATTR %s->%s\n", attr->value, attv->content);
+            }
         }
     }
 
@@ -530,6 +726,14 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     freeEncodedData(&postData);
     WXML_Destroy(root);
 
+    return;
+
+samlerr:
+    if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
+    freeEncodedData(&postData);
+    WXML_Destroy(root);
+    NGXMGR_IssueErrorResponse(conn, 401, "Unauthorized (SAML)",
+                        "Invalid signed SAML response or error in processing");
     return;
 
 memfail:
