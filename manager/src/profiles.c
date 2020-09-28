@@ -155,6 +155,8 @@ typedef struct {
 
     /* Derived elements from configuration */
     X509 *idpCertificate;
+    WXJSONValue *attributes;
+    WXDictionary attrMap;
 
     /* Other profile-specific data (all accessed in event thread) */
     WXHashTable reqSessions;
@@ -189,13 +191,71 @@ static WXJSONBindDefn samlBindings[] = {
     { "idpCertificate", WXJSONBIND_STR,
       offsetof(SAMLProfile, encodedCert), FALSE },
     { "clockSkew", WXJSONBIND_INT,
-      offsetof(SAMLProfile, clockSkew), FALSE }
+      offsetof(SAMLProfile, clockSkew), FALSE },
+    { "attributes", WXJSONBIND_REF,
+      offsetof(SAMLProfile, attributes), FALSE }
 };
 
 #define SAML_CFG_COUNT (sizeof(samlBindings) / sizeof(WXJSONBindDefn))
 
 /* Forward declare for initialization, instance defined at end */
 static NGXMGR_Profile SAMLBaseProfile;
+
+/* Default map of SAML assertion attributes for variable keys */
+static struct {
+    char *uri, *key;
+} dfltAttrs[] = {
+    /* Note that the URI's are mapping in a case-insensitive manner */
+    { "firstname", "givenname" },
+    { "givenname", "givenname" },
+    { "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname",
+          "givenname" },
+
+    { "lastname", "surname" },
+    { "surname", "surname" },
+    { "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname",
+          "surname" },
+
+    { "displayname", "displayname" },
+    { "fullname", "displayname" },
+    { "http://schemas.microsoft.com/identity/claims/displayname",
+          "displayname" },
+
+    { "emailaddress", "emailaddress" },
+    { "email", "emailaddress" },
+    { "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+          "emailaddress" }
+};
+
+#define DFLT_ATTR_COUNT (sizeof(dfltAttrs) / sizeof(dfltAttrs[0]))
+
+static int samlAttrScanner(WXHashTable *table, void *key, void *obj,
+                           void *userData) {
+    WXJSONValue *val = (WXJSONValue *) obj, *aval;
+    WXDictionary *attrMap = (WXDictionary *) userData;
+    int idx;
+
+    if (val->type == WXJSONVALUE_STRING) {
+        if (!WXDict_PutEntry(attrMap, val->value.sval, (char *) key)) {
+            WXLog_Error("Memory failure defining attribute map");
+        }
+    } else if (val->type == WXJSONVALUE_ARRAY) {
+        aval = (WXJSONValue *) val->value.aval.array;
+        for (idx = 0; idx < val->value.aval.length; aval++, idx++) {
+            if (aval->type == WXJSONVALUE_STRING) {
+                if (!WXDict_PutEntry(attrMap, aval->value.sval, (char *) key)) {
+                    WXLog_Error("Memory failure defining attribute map");
+                }
+            } else {
+                WXLog_Error("Invalid mapping array entry (not string");
+            }
+        }
+    } else {
+        WXLog_Error("Invalid attribute definition value (string/array)");
+    }
+
+    return 0;
+}
 
 /* Standard initialization method for a SAML profile */
 static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
@@ -204,6 +264,7 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
     char errMsg[1024];
     BIO *bio;
     size_t l;
+    int idx;
 
     /* First call will not provide a value */
     if (retval == NULL) {
@@ -227,10 +288,11 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         retval->encodedCert = FALSE;
         retval->clockSkew = 0;
 
+        retval->attributes = NULL;
         retval->idpCertificate = NULL;
-
-        if (!WXHash_InitTable(&(retval->reqSessions), 64)) {
-            WXLog_Error("Memory failure allocating certificate content");
+        if ((!WXDict_Init(&(retval->attrMap), 64, FALSE)) ||
+                (!WXHash_InitTable(&(retval->reqSessions), 64))) {
+            WXLog_Error("Memory failure allocating mapping content");
             WXFree(retval);
             return NULL;
         }
@@ -242,6 +304,24 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         /* Possibly memory leak here, turning a blind eye... */
         WXLog_Error("SAML configuration binding error: %s", errMsg);
         return NULL;
+    }
+
+    /* Translate the attribute mappings */
+    WXDict_Empty(&(retval->attrMap));
+    for (idx = 0; idx < DFLT_ATTR_COUNT; idx++) {
+        if (!WXDict_PutEntry(&(retval->attrMap), dfltAttrs[idx].uri,
+                             dfltAttrs[idx].key)) {
+            WXLog_Error("Memory failure defining attributes");
+            return NULL;
+        }
+    }
+    if (retval->attributes != NULL) {
+        if (retval->attributes->type != WXJSONVALUE_OBJECT) {
+            WXLog_Error("Attributes configuration must be a JSON object/map");
+        } else {
+            (void) WXHash_Scan(&(retval->attributes->value.oval),
+                               samlAttrScanner, &(retval->attrMap));
+        }
     }
 
     /* Post-process the validation certificate, if provided */
@@ -502,13 +582,16 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     WXMLLinkedElement *signedRefs = NULL, *sref;
     SAMLProfile *profile = (SAMLProfile *) prf;
     BIO *base64Dec, *base64Buff = NULL;
-    WXHashTable postData, attributes;
     SAMLReqSession *reqSession;
+    WXDictionary attributes;
+    WXHashTable postData;
     WXMLAttribute *attr;
+    const char *key;
     time_t tm;
     int len;
 
     /* Decode the form arguments */
+    attributes.base.entries = NULL;
     if ((!WXHash_InitTable(&postData, 16)) ||
             (!parseFormEncoded(&postData, data, dataLen))) goto memfail;
 
@@ -557,6 +640,9 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             goto samlerr;
         }
     }
+
+    /* Prepare for session attribute collection */
+    if (!WXDict_Init(&attributes, 16, FALSE)) goto memfail;
 
     /* Validations of response assertions according to SAML spec 4.1.4.2/3 */
     nameId = NULL;
@@ -691,7 +777,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         /* Poorly behaving IdP could mess with multiples, oh well */
         if ((conf != NULL) &&
                 ((val = WXML_Find(conf->parent->parent,
-                                  "/NameID", FALSE)) == NULL) &&
+                                  "/NameID", FALSE)) != NULL) &&
                 (val->content != NULL)) {
             nameId = val->content;
             WXLog_Debug("Validated principal assertion for '%s'", nameId);
@@ -712,16 +798,37 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                 if (((attv = WXML_Find(chld, "/AttributeValue",
                                        FALSE)) == NULL) ||
                         (attv->content == NULL)) continue;
-fprintf(stderr, "ATTR %s->%s\n", attr->value, attv->content);
+
+                /* Only consume recognized attribute instances */
+                key = WXDict_GetEntry(&(profile->attrMap), attr->value);
+                if (key == NULL) continue;
+                if (!WXDict_PutEntry(&attributes, key, attv->content)) {
+                    goto memfail;
+                }
             }
         }
     }
 
-    /* Bogus for now! */
-    NGXMGR_IssueErrorResponse(conn, 500, "It's an error!",
-                              "Test '%s' %d", "test", 12);
+    /* Final test, one of the Assertions must have validated user identity */
+    if (nameId == NULL) {
+        NGXMGR_IssueErrorResponse(conn, 400, "Improper SAML Response",
+                                  "One or more signature/validation errors in "
+                                  "SAML response, unable to validate user "
+                                  "identity");
+    } else {
+        /* Populuate the uid unless already provided (swap) */
+        if ((ptr = (char *) WXDict_GetEntry(&attributes, "uid")) == NULL) {
+            if (!WXDict_PutEntry(&attributes, "uid", nameId)) goto memfail;
+        } else {
+            nameId = ptr;
+        }
+
+        NGXMGR_IssueErrorResponse(conn, 500, "It's an error!",
+                                  "Test '%s' %d", "test", 12);
+    }
 
     /* Cleanup */
+    WXDict_Destroy(&attributes);
     if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
     freeEncodedData(&postData);
     WXML_Destroy(root);
@@ -729,6 +836,7 @@ fprintf(stderr, "ATTR %s->%s\n", attr->value, attv->content);
     return;
 
 samlerr:
+    if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
     if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
     freeEncodedData(&postData);
     WXML_Destroy(root);
@@ -737,7 +845,8 @@ samlerr:
     return;
 
 memfail:
-    WXLog_Error("Memory allocation failure!");
+    WXLog_Error("Memory allocation failure in SAML response processing");
+    if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
     if (postData.entries != NULL) freeEncodedData(&postData);
     if (base64Buff != NULL) BIO_free_all(base64Buff);
     if (decSamlResp != NULL) WXFree(decSamlResp);
