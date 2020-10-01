@@ -37,10 +37,10 @@ typedef enum NGXMGR_Command {
      *   sessionId: standard string containing externally provided session
      *              identifier or access token (note that one action could be
      *              logout).  Empty if undefined
-     *   sourceAddr: standard string containing IP address of the source
-     *               request, for logging and optional validation
+     *   sourceIpAddr: standard string containing IP address of the source
+     *                 request, for logging and optional validation
      *   request: standard string containing amalgamated method/uri details
-     *            of the request, for logging
+     *            of the request, for logging and redirection
      *   [data]: for ACTION instances associated to HTTP POST requests, the
      *           remainder of the request after the strings is the binary
      *           POST content
@@ -90,18 +90,28 @@ typedef enum NGXMGR_Response {
 
     /*
      * VALIDATE_SESSION response when the session is valid and processing
-     * can continue (redirect by the nginx module).  There is no additional
-     * content with this response, all directives are managed by the nginx
-     * configuration.
+     * can continue (redirect by the nginx module).  Remaining content is a
+     * set of length-encoded pairs of strings, which represent any nginx
+     * variables to be defined based on the underlying session information.
+     * For both the CONTINUE and ESTABLISH messages, the variable set has the
+     * session identifier first with the key of 'sid'.
      */
     NGXMGR_SESSION_CONTINUE = 0x02,
+
+    /*
+     * Response from action requests where a session has been established.
+     * Remaining content (all length-encoded strings) is the target URL to
+     * redirect to, followed by the set of session variable/attribute settings
+     * as for the CONTINUE response.
+     */
+    NGXMGR_SESSION_ESTABLISH = 0x03,
 
     /*
      * Response for any request, perform a 302 (temporarily moved) redirect
      * either for OAuth/SSO processing or login redirection.  Content contains
      * the text of the redirect location (not a length-lead string).
      */
-    NGXMGR_EXTERNAL_REDIRECT = 0x03,
+    NGXMGR_EXTERNAL_REDIRECT = 0x04,
 
     /*
      * Common response type for manager streamed content (verbatim).  Returns
@@ -111,7 +121,7 @@ typedef enum NGXMGR_Response {
      *     - associated page content, no length as the entire remainder
      *       of the message is the content
      */
-    NGXMGR_CONTENT_RESPONSE = 0x04,
+    NGXMGR_CONTENT_RESPONSE = 0x05,
 
     /*
      * Response for any request, issue an error response (mainly intended for
@@ -120,7 +130,12 @@ typedef enum NGXMGR_Response {
      *     - associated error page content, no length as the entire remainder
      *       of the message is the content
      */
-    NGXMGR_ERROR_RESPONSE = 0x05
+    NGXMGR_ERROR_RESPONSE = 0x06,
+
+    /*
+     * Internal value for parse error handling.
+     */
+    NGXMGR_ERROR_UKNOWN = 0x07
 } NGXMGR_Response;
 
 #endif

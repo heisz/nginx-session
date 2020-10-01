@@ -361,7 +361,7 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
 
 /* Verify processing method for the SAML profile, establish new session */
 static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
-                              char *request) {
+                              char *sourceIpAddr, char *request) {
     char *url, *enc, *sessReqId, xmlBuff[1024], *deflateBuff, tmBuff[64];
     SAMLProfile *profile = (SAMLProfile *) prf;
     WXMLNamespace *samlNs, *samlpNs, authNs;
@@ -574,9 +574,34 @@ static time_t parseRTT(char *which, char *tmstr) {
            atoi(tmstr + 17);
 }
 
+/* Session allocation callback to complete login sequence */
+static void SAMLLoginSessionHandler(NGXModuleConnection *conn,
+                                    char *sessionId, WXBuffer *attributes) {
+    char *url = "/index.html";
+    uint8_t rspBuffer[1024];
+    WXBuffer rsp;
+
+    WXBuffer_InitLocal(&rsp, rspBuffer, sizeof(rspBuffer));
+    if ((sessionId == NULL) || 
+            (WXBuffer_Pack(&rsp, "sa*c", (uint16_t) strlen(url), url,
+                           (uint8_t) 0) == NULL) ||
+            (WXBuffer_Append(&rsp, attributes->buffer, attributes->length,
+                             TRUE) == NULL)) {
+        NGXMGR_IssueErrorResponse(conn, 500, "Internal Session Error",
+                                  "Internal error in session allocation");
+    } else {
+        /* Session establish response with redirect */
+        NGXMGR_IssueResponse(conn, NGXMGR_SESSION_ESTABLISH,
+                             rsp.buffer, rsp.length);
+
+        /* Note that mem failure can only occur on attribute buffer attach */
+        WXBuffer_Destroy(&rsp);
+    }
+}
+
 /* Process SAML commands, establish login completion or logout */
 static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
-                      char *data, int dataLen) {
+                      char *sourceIpAddr, char *data, int dataLen) {
     WXMLElement *root = NULL, *node, *chld, *prnt, *conf, *val, *attrs, *attv;
     char *ptr, *samlResp, *decSamlResp = NULL, errorMsg[1024], *nameId;
     WXMLLinkedElement *signedRefs = NULL, *sref;
@@ -816,15 +841,17 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                                   "SAML response, unable to validate user "
                                   "identity");
     } else {
-        /* Populuate the uid unless already provided (swap) */
+        /* Populate the uid unless already provided (swap) */
         if ((ptr = (char *) WXDict_GetEntry(&attributes, "uid")) == NULL) {
             if (!WXDict_PutEntry(&attributes, "uid", nameId)) goto memfail;
         } else {
             nameId = ptr;
         }
 
-        NGXMGR_IssueErrorResponse(conn, 500, "It's an error!",
-                                  "Test '%s' %d", "test", 12);
+        /* Finally!  Generate a session instance */
+        /* TODO - handle externally specified exiry time */
+        NGXMGR_AllocateNewSession(sourceIpAddr, -1, &attributes, conn,
+                                  SAMLLoginSessionHandler);
     }
 
     /* Cleanup */
@@ -856,10 +883,10 @@ memfail:
 }
 
 static void SAMLProcessAction(NGXMGR_Profile *prof, NGXModuleConnection *conn,
-                              char *request, char *action, char *sessionId,
-                              char *data, int dataLen) {
+                              char *sourceIpAddr, char *request, char *action,
+                              char *sessionId, char *data, int dataLen) {
     if ((strcmp(action, "login") == 0) && (strncmp(request, "PST", 3) == 0)) {
-        SAMLLogin(prof, conn, data, dataLen);
+        SAMLLogin(prof, conn, sourceIpAddr, data, dataLen);
     } else {
         WXLog_Error("Unrecognized action/request: %s - %s", action, request);
         NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Configuration",

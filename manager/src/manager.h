@@ -46,6 +46,7 @@ typedef struct {
 
     /* Session management options */
     size_t sessionIdLen;
+    size_t sessionIdleTime;
     size_t sessionLifespan;
     int sessionIPLocked;
 
@@ -114,12 +115,12 @@ struct NGXMGR_Profile {
 
     /* Process the outcome of a verify request that is invalid */
     void (*processVerify)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
-                          char *request);
+                          char *sourceIpAddr, char *request);
 
     /* Process an explicit action against the profile/session */
     void (*processAction)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
-                          char *request, char *action, char *sessionId,
-                          char *data, int dataLen);
+                          char *sourceIpAddr, char *request, char *action,
+                          char *sessionId, char *data, int dataLen);
 };
 
 /* Exposed allocation method for creating profiles instances from config */
@@ -134,6 +135,18 @@ typedef struct WXMLLinkedElement {
 /* Batches of methods for managing sessions (finally!) */
 void NGXMGR_InitializeSessions();
 char *NGXMGR_GenerateSessionId(int idlen);
-int NGXMGR_VerifySessionState(char *sessionId, char *sourceIpAddr);
+int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
+                           WXBuffer *attrs);
+
+/* Callback definition for asynchronous session completion */
+/* Session id and attributes are internal references, must not block */
+typedef void NGXMGR_CompleteSessionHandler(NGXModuleConnection *conn,
+                                           char *sessionId,
+                                           WXBuffer *attributes);
+
+void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
+                               WXDictionary *attributes,
+                               NGXModuleConnection *conn,
+                               NGXMGR_CompleteSessionHandler handler);
 
 #endif

@@ -72,7 +72,8 @@ NGXMGRGlobalDataType GlobalData = {
     /* sessionLogFileName = */ NULL,
 
     /* sessionIdLen = */ 64,
-    /* sessionLifespan = */ 300,
+    /* sessionIdleTime = */ 300,
+    /* sessionLifespan = */ 86400,
     /* sessionIPLocked = */ FALSE,
 
     /* ---- */
@@ -109,6 +110,8 @@ static WXJSONBindDefn cfgBindings[] = {
 
     { "session.idLength", WXJSONBIND_SIZE,
       offsetof(NGXMGRGlobalDataType, sessionIdLen), FALSE },
+    { "session.idleTime", WXJSONBIND_SIZE,
+      offsetof(NGXMGRGlobalDataType, sessionIdleTime), FALSE },
     { "session.lifespan", WXJSONBIND_SIZE,
       offsetof(NGXMGRGlobalDataType, sessionLifespan), FALSE },
     { "session.ipLocked", WXJSONBIND_BOOLEAN,

@@ -195,9 +195,10 @@ void NGXMGR_IssueErrorResponse(NGXModuleConnection *conn, uint16_t errorCode,
 void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
     char *ptr, *action = NULL, *sessionId, *sourceIpAddr, *request;
     int l, len, rc, sessionIsValid = FALSE;
+    uint8_t command, attrBuff[1024];
     NGXMGR_Profile *profile;
+    WXBuffer sessionAttrs;
     char timestamp[128];
-    uint8_t command;
 
     /* Flush pending write operations before reading more (shouldn't be any) */
     if ((events & WXEVENT_OUT) != 0) {
@@ -360,7 +361,9 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         /* Any trailing elements are ACTION details, ignored for others */
 
         /* Validate session up front, so we can log determined state */
-        sessionIsValid = NGXMGR_VerifySessionState(sessionId, sourceIpAddr);
+        WXBuffer_InitLocal(&sessionAttrs, attrBuff, sizeof(attrBuff));
+        sessionIsValid = NGXMGR_ValidateSession(sessionId, sourceIpAddr,
+                                                &sessionAttrs);
 
         /* Generate session log entry if enabled */
         if (GlobalData.sessionLogFile != NULL) {
@@ -378,19 +381,20 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         /* Certain conditions are immediately resolvable */
         if ((sessionIsValid) && (command != NGXMGR_SESSION_ACTION)) {
             /* All verify requests just continue if session is validated */
-            NGXMGR_IssueResponse(conn, NGXMGR_SESSION_CONTINUE, "", 0);
+            NGXMGR_IssueResponse(conn, NGXMGR_SESSION_CONTINUE,
+                                 sessionAttrs.buffer, sessionAttrs.length);
         } else if (command == NGXMGR_VALIDATE_SESSION) {
             /* For validate, only response is invalid if not valid */
             NGXMGR_IssueResponse(conn, NGXMGR_SESSION_INVALID, "", 0);
-           
         } else {
             /* Let the profile handle the remaining request actions */
             if (command == NGXMGR_VERIFY_SESSION) {
-                (profile->processVerify)(profile, conn, request);
+                (profile->processVerify)(profile, conn, sourceIpAddr, request);
             } else {
-                (profile->processAction)(profile, conn, request, action,
-                                         sessionId, ptr, len);
+                (profile->processAction)(profile, conn, sourceIpAddr, request,
+                                         action, sessionId, ptr, len);
             }
         }
+        WXBuffer_Destroy(&sessionAttrs);
     }
 }
