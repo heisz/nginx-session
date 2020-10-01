@@ -583,7 +583,7 @@ static void SAMLLoginSessionHandler(NGXModuleConnection *conn,
 
     WXBuffer_InitLocal(&rsp, rspBuffer, sizeof(rspBuffer));
     if ((sessionId == NULL) || 
-            (WXBuffer_Pack(&rsp, "sa*c", (uint16_t) strlen(url), url,
+            (WXBuffer_Pack(&rsp, "na*c", (uint16_t) strlen(url), url,
                            (uint8_t) 0) == NULL) ||
             (WXBuffer_Append(&rsp, attributes->buffer, attributes->length,
                              TRUE) == NULL)) {

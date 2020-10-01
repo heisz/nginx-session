@@ -154,7 +154,7 @@ static int encodeAttribute(WXDictionary *dict, const char *key,
                            const char *val, void *userData) {
     WXBuffer *buffer = (WXBuffer *) userData;
 
-    return (WXBuffer_Pack(buffer, "sa*csa*c",
+    return (WXBuffer_Pack(buffer, "na*cna*c",
                           (uint16_t) strlen(key), key, (uint8_t) 0,
                           (uint16_t) strlen(val), val, (uint8_t) 0) == NULL);
 }
