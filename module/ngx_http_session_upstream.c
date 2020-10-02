@@ -104,9 +104,28 @@ static ngx_int_t ngx_http_session_reinit_request(ngx_http_request_t *req) {
 
 /* Note, this needs to align exactly with the enumeration */
 static char *ngx_https_session_rcstr[] = {
-    "Response_Pending", "Session_Invalid", "Session_Continue",
-    "External_Redirect", "Content_Response" ,"Error_Response"
+    "response_pending", "session_invalid", "session_continue",
+    "session_establish", "external_redirect", "content_response",
+    "error_response", "unknown"
 };
+
+/* Validator for incoming string sequences (URL and variables) */
+static ngx_int_t ngx_http_session_validate_strlist(u_char *ptr, uint32_t len,
+                                                   uint16_t *first) {
+    ngx_int_t cnt = 0;
+    uint16_t l;
+
+    while (len > 3) {
+        l = ntohs(*((uint16_t *) ptr));
+        if (l > (len - 2)) return -1;
+        ptr += l + 2;
+        if (*(ptr++) != '\0') return -1;
+        len -= l + 3;
+        if (((cnt++) == 0) && (first != NULL)) *first = l;
+    }
+    if (len != 0) return -1;
+    return cnt;
+}
 
 /**
  * Parse the response information from the manager, translating it into
@@ -121,7 +140,9 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     ngx_http_session_request_ctx_t *ctx =
                         ngx_http_get_module_ctx(req, ngx_http_session_module);
     uint32_t resp_len, buff_len;
-    uint16_t type_len;
+    uint16_t type_len, url_len;
+    ngx_table_elt_t *sess_hdr;
+    ngx_int_t cnt;
     u_char code;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
@@ -134,6 +155,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     code = *(upstr->buffer.pos);
     upstr->length = resp_len + 4;
 
+    if (code >= NGXMGR_ERROR_UKNOWN) code = NGXMGR_ERROR_UKNOWN;
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: manager response %s: %d bytes",
                    ngx_https_session_rcstr[code], (int) resp_len);
@@ -148,6 +170,9 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
          * switch to the target or issue an unauthorized error condition.
          */
         if (ctx->slcf->invalid_redirect_target.data == NULL) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                           "*** session manager: invalid sessn, unauthorized");
+
             /* TODO - should we inject page content for display? */
             upstr->headers_in.content_length_n = 0;
             upstr->headers_in.status_n = NGX_HTTP_UNAUTHORIZED;
@@ -155,6 +180,11 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
             upstr->keepalive = 1;
             return NGX_OK;
         } else {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                           "*** session manager: invalid sessn, redirect %*s",
+                           (int) ctx->slcf->invalid_redirect_target.len,
+                           ctx->slcf->invalid_redirect_target.data);
+
             upstr->headers_in.x_accel_redirect =
                                ngx_list_push(&(upstr->headers_in.headers));
             if (upstr->headers_in.x_accel_redirect == NULL) return NGX_ERROR;
@@ -173,7 +203,17 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     }
 
     if (code == NGXMGR_SESSION_CONTINUE) {
-        /* Full response is required (but should be here, being empty) */
+        /* Full response is required for variable handling */
+        if (buff_len < resp_len) return NGX_AGAIN;
+
+        /* Verify variable set, assign to context */
+        cnt = ngx_http_session_validate_strlist(upstr->buffer.pos + 4,
+                                                resp_len, NULL);
+        if ((cnt <= 0) || ((cnt & 0x01) != 0)) {
+            ngx_log_error(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                          "*** session manager: invalid manager varset");
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
 
         /*
          * Note: there was a lot of experimentation with redirect, but it kept
@@ -192,6 +232,63 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         upstr->headers_in.content_length_n = 0;
         upstr->headers_in.status_n = NGX_HTTP_OK;
         upstr->buffer.pos += 4 + resp_len;
+        upstr->keepalive = 1;
+
+        return NGX_OK;
+    }
+
+    if (code == NGXMGR_SESSION_ESTABLISH) {
+        /* Full response is required for redirect and variable setting */
+        if (buff_len < resp_len) return NGX_AGAIN;
+
+        /* Verify variable set, assign to context */
+        cnt = ngx_http_session_validate_strlist(upstr->buffer.pos + 4,
+                                                resp_len, &url_len);
+        if ((cnt <= 0) || ((cnt & 0x01) != 1)) {
+            ngx_log_error(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+                          "*** session manager: invalid manager sess/varset");
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
+
+        /* Set up the redirect header (TODO - handle @ internal redirect?) */
+        /* Or handle empty local configuration? */
+        req->headers_out.location = ngx_list_push(&(req->headers_out.headers));
+        if (req->headers_out.location == NULL) return NGX_ERROR;
+        req->headers_out.location->hash = 1;
+        ngx_str_set(&(req->headers_out.location->key), "Location");
+        req->headers_out.location->value.len = url_len;
+        req->headers_out.location->value.data = ngx_palloc(req->pool, url_len);
+        if (req->headers_out.location->value.data == NULL) return NGX_ERROR;
+        ngx_memcpy(req->headers_out.location->value.data,
+                   upstr->buffer.pos + 6, url_len);
+
+        /* Define the context attribute set */
+        ctx->attributes_length = resp_len - url_len - 7;
+        ctx->attributes = ngx_palloc(req->pool, ctx->attributes_length);
+        if (ctx->attributes == NULL) return NGX_ERROR;
+        (void) memcpy(ctx->attributes, upstr->buffer.pos + url_len + 7,
+                      ctx->attributes_length);
+
+        /* Push the session cookie if defined (first attribute named sid) */
+        if (ctx->slcf->cookie_name.len != 0) {
+            sess_hdr = ngx_list_push(&(req->headers_out.headers));
+            if (sess_hdr == NULL) return NGX_ERROR;
+            sess_hdr->hash = 1;
+            ngx_str_set(&(sess_hdr->key), "Set-Cookie");
+            sess_hdr->value.len =
+                   ntohs(*((uint16_t *) (ctx->attributes + 6)));
+            sess_hdr->value.data = ngx_palloc(req->pool, sess_hdr->value.len);
+            if (sess_hdr->value.data == NULL) return NGX_ERROR;
+            ngx_memcpy(sess_hdr->value.data,
+                       ctx->attributes + 8, sess_hdr->value.len);
+        }
+
+        /* Entire response is just a header set of redirect */
+        upstr->headers_in.content_length_n = 0;
+        upstr->headers_in.status_n = NGX_HTTP_MOVED_TEMPORARILY;
+        upstr->state->status = NGX_HTTP_MOVED_TEMPORARILY;
+        upstr->buffer.pos += 4 + resp_len;
+        req->header_only = 1;
         upstr->keepalive = 1;
 
         return NGX_OK;

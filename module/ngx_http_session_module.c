@@ -296,12 +296,71 @@ static char *ngx_http_session_merge_loc_conf(ngx_conf_t *cf,
     return NGX_CONF_OK;
 }
 
+/* Handler for processing dynamic session variable references */
+static ngx_str_t var_pfx = ngx_string("ngxssn_");
+static ngx_int_t ngx_http_session_var(ngx_http_request_t *req,
+                                      ngx_http_variable_value_t *var,
+                                      uintptr_t data) {
+    ngx_http_session_request_ctx_t *ctx;
+    ngx_str_t *name = (ngx_str_t *) data;
+    ngx_int_t len, vlen = name->len - var_pfx.len;
+    u_char *ptr, *arg = name->data + var_pfx.len;
+    uint16_t l;
+
+    /* Ensure we are in response context and variables are defined */
+    if (((ctx = ngx_http_get_module_ctx(req,
+                                        ngx_http_session_module)) == NULL) ||
+            (ctx->request == NULL) || (ctx->attributes == NULL)) {
+        var->not_found = 1;
+        return NGX_OK;
+    }
+
+    /* Otherwise parse the attributes for the variable suffix */
+    /* Note that the content was validated during the original receipt/copy */
+    ptr = ctx->attributes;
+    len = ctx->attributes_length;
+    while (len > 0) {
+        l = ntohs(*((uint16_t *) ptr));
+        if ((l == vlen) && (memcmp(ptr + 2, arg, vlen) == 0)) {
+            var->data = ptr + l + 5;
+            var->len = ntohs(*((uint16_t *) ptr + l + 3));
+            var->valid = 1;
+            var->no_cacheable = 0;
+            var->not_found = 0;
+            return NGX_OK;
+        }
+
+        l += ntohs(*((uint16_t *) ptr + l + 3)) + 6;
+        ptr += l;
+        len -= l;
+    }
+
+    var->not_found = 1;
+    return NGX_OK;
+}
+
+static ngx_int_t ngx_http_session_var_init(ngx_conf_t *cf) {
+    ngx_http_variable_t *var;
+
+    /* Often see loop over static array, but we have one dynamic instance */
+    var = ngx_http_add_variable(cf, &var_pfx,
+                                NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_PREFIX);
+    if (var == NULL) return NGX_ERROR;
+    var->get_handler = ngx_http_session_var;
+    var->data = 0;
+
+    return NGX_OK;
+}
+
 /* Used in several places */
 static ngx_str_t access_token_str = ngx_string("access_token");
 static ngx_str_t oauth_token_str = ngx_string("oauth_token");
 
 /* Internal structure to track form completion and pass session data */
 typedef struct {
+    /* Marking placeholder, this will be null for form handling */
+    ngx_http_request_t *request;
+
     /* Tracking elements for the body content handler */
     ngx_int_t waiting;
     ngx_int_t finished;
@@ -504,6 +563,7 @@ static ngx_int_t ngx_http_session_rewrite_handler(ngx_http_request_t *req) {
     /* Set up for form body reading (handy of pcalloc to clear the flags) */
     fctx = ngx_pcalloc(req->pool, sizeof(ngx_http_session_form_ctx_t));
     if (fctx == NULL) return NGX_ERROR;
+    fctx->request = NULL;
     ngx_http_set_ctx(req, fctx, ngx_http_session_module);
 
     /* Read the body and pass along to the next handler when done */
@@ -578,9 +638,9 @@ static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /* The module context, provides methods for module definition/configuration */
 static ngx_http_module_t ngx_http_session_module_ctx = {
-    NULL,
-    ngx_http_session_main_init, ngx_http_session_create_main_conf,
-    NULL, NULL, NULL,
+    ngx_http_session_var_init, ngx_http_session_main_init,
+    ngx_http_session_create_main_conf, NULL,
+    NULL, NULL,
     ngx_http_session_create_loc_conf, ngx_http_session_merge_loc_conf
 };
 
@@ -830,6 +890,8 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     /* Attach to the request context */
     ctx->request = req;
     ctx->slcf = slcf;
+    ctx->attributes = NULL;
+    ctx->attributes_length = 0;
     ngx_http_set_ctx(req, ctx, ngx_http_session_module);
 
     /* Generate/push to the upstream data instance, with POST handling */

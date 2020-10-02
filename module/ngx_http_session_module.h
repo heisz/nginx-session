@@ -56,6 +56,10 @@ typedef struct {
     /* The outbound manager request content */
     uint8_t *request_content;
     uint32_t request_length;
+
+    /* Manager variable/attribute response information */
+    u_char *attributes;
+    uint32_t attributes_length;
 } ngx_http_session_request_ctx_t;
 
 /* Exposed method to create the upstream request instance */
