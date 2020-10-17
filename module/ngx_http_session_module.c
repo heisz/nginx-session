@@ -903,6 +903,13 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
  * the upstream instance and registers the session request handler for
  * incoming requests to this location.
  *
+ * Configuration syntax:
+ *    session_redirect <upstream> <profile> <valid> [<invalid>]
+ *    (if <invalid> is missing generates unauthorized condition)
+ *
+ * Used to do a quick redirection based on the validity of the session or
+ * provide a simple access wrapping of a protected resource.
+ *
  * @param cf The module/location configuration instance reference.
  * @param cmd Reference to the original directives for the module.
  * @param conf Configuration content for the module instance.
@@ -960,8 +967,10 @@ static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
  * incoming requests to this location.
  *
  * Configuration syntax:
- *    session_verify <upstream> <success> [<fail>]
- *    (if fail is missing generates unauthorized condition)
+ *    session_verify <upstream> <profile> <valid> [<invalid>]
+ *    (if <invalid> is missing generates unauthorized condition)
+ *
+ * Unlike redirect, verify requests can be redirected by the profile itself.
  *
  * @param cf The module/location configuration instance reference.
  * @param cmd Reference to the original directives for the module.
@@ -1019,6 +1028,10 @@ static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
  * Parsing method for the session_action directive.  Registers/binds to
  * the upstream instance and registers the session request handler for
  * incoming requests to this location.
+ *
+ * Configuration syntax:
+ *    session_action <upstream> <profile> <action>
+ *    (if <invalid> is missing generates unauthorized condition)
  *
  * @param cf The module/location configuration instance reference.
  * @param cmd Reference to the original directives for the module.
