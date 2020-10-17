@@ -1,14 +1,24 @@
 # Configuring the nginx-session Module and Manager
 
-This document details the various directives for configuring the nginx-session module (for session determination, verification and management) followed by configuration information for the various supported 'modes' of session authentication.
+This document details the various directives for configuring the nginx-session
+module (for session determination, verification and management) followed by
+configuration information for the various supported 'modes' of session
+authentication.
 
 ## Module Directives
 
-This section outlines the various directives used to configure the nginx-session module, organized by major functional areas.
+This section outlines the various directives used to configure the
+nginx-session module, organized by major functional areas.
 
 ### Session Determination
 
-There are a number of directives that control the determination of an incoming session identifier, as the token can arrive via several possible HTTP mechanisms depending on the actual authentication model being used.  The following lists the various directives in priority order, in that the first one to find a potential session identifier (non-empty value) will be used - the module and associated manager will not validate _all_ possible session idenitifier values in the hope of finding a valid instance.
+There are a number of directives that control the determination of an incoming
+session identifier, as the token can arrive via several possible HTTP
+mechanisms depending on the actual authentication model being used.  The
+following lists the various directives in priority order, in that the first
+one to find a potential session identifier (non-empty value) will be
+used - the module and associated manager will not validate _all_ possible
+session idenitifier values in the hope of finding a valid instance.
 
 > Syntax: **session_form_parameter** [_name_];  
 > Default: depends on context  
