@@ -104,8 +104,8 @@ int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
 
     /* Pretty straightforward, lookup/validate under global MT lock */
     (void) WXThread_MutexLock(&sessionsLock);
-    session == WXHash_GetEntry(&sessions, sessionId, WXHash_StrHashFn,
-                               WXHash_StrEqualsFn);
+    session = WXHash_GetEntry(&sessions, sessionId, WXHash_StrHashFn,
+                              WXHash_StrEqualsFn);
     if (session != NULL) {
         if ((currentTm > session->expiry) ||
                 ((GlobalData.sessionIdleTime > 0) &&

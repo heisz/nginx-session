@@ -16,6 +16,9 @@ static char *ngx_http_session_set_bitmask(ngx_conf_t *cf, ngx_command_t *cmd,
                                           void *conf);
 static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
                                              void *conf);
+static char *ngx_http_session_cookie_flags(ngx_conf_t *cf, ngx_command_t *cmd,
+                                           void *conf);
+
 static char *ngx_http_session_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
                                        void *conf);
 static char *ngx_http_session_verify(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -139,6 +142,12 @@ static ngx_command_t ngx_http_session_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       0, NULL},
 
+    { ngx_string("session_cookie_flags"),
+      NGX_HTTP_GLOBAL_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_1MORE,
+      ngx_http_session_cookie_flags,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0, NULL},
+
     /* Status command for debugging interface */
     { ngx_string("session_status"),
       NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
@@ -204,6 +213,7 @@ static void *ngx_http_session_create_loc_conf(ngx_conf_t *cf) {
     // conf->oauth_mode = 0;
     // conf->form_param_name = { 0, NULL };
     conf->form_param_enabled = NGX_CONF_UNSET;
+    // conf->session_cookie_flags = { 0, NULL };
 
     return conf;
 }
@@ -292,6 +302,7 @@ static char *ngx_http_session_merge_loc_conf(ngx_conf_t *cf,
     ngx_sess_conf_merge_str(conf->form_param_name, prev->form_param_name);
     ngx_conf_merge_value(conf->form_param_enabled, prev->form_param_enabled,
                          NGX_CONF_UNSET);
+    ngx_sess_conf_merge_str(conf->cookie_flags, prev->cookie_flags);
 
     return NGX_CONF_OK;
 }
@@ -632,6 +643,103 @@ static char *ngx_http_session_form_parameter(ngx_conf_t *cf, ngx_command_t *cmd,
     /* Force rewrite handler registration in main configuration completion */
     smcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_session_module);
     smcf->form_param_needed = NGX_TRUE;
+
+    return NGX_CONF_OK;
+}
+
+/* Flag bitset for cookie security options */
+#define NGX_HTTP_SESSION_COOKIE_HTTPONLY 0x01
+#define NGX_HTTP_SESSION_COOKIE_SECURE 0x02
+#define NGX_HTTP_SESSION_COOKIE_SAMESITE_MASK 0xF0
+#define NGX_HTTP_SESSION_COOKIE_SAMESITE_NONE 0x10
+#define NGX_HTTP_SESSION_COOKIE_SAMESITE_LAX 0x20
+#define NGX_HTTP_SESSION_COOKIE_SAMESITE_STRICT 0x40
+
+static char *ngx_http_session_cookie_flags(ngx_conf_t *cf, ngx_command_t *cmd,
+                                           void *conf) {
+    ngx_str_t *values = (ngx_str_t *) cf->args->elts;
+    ngx_http_session_loc_conf_t *slcf = conf;
+    ngx_uint_t idx, flags = 0;
+    u_char *ptr;
+
+    /* Avoid confusion, only set once */
+    if (slcf->cookie_flags.len != 0) {
+        return "- duplicate session cookie flags specified";
+    }
+
+    /* NOTE: need to consider other possible flags:
+     *
+     *    - Expires - nginx-session is really a session manager (session cookie)
+     *                and has its own expiry mechanism
+     *    - Max-Age - see above
+     *    - Domain - this is a possibility, but should be a separate option
+     *    - Path - uuuurrrrgh, this really bit me for SSO!!!!
+     */
+
+    /* Otherwise build the flagset */
+    /* Note: could care about multiple settings inside, but don't... */
+    for (idx = 1; idx < cf->args->nelts; idx++) {
+        if ((values[idx].len == 8) &&
+            (ngx_strncasecmp(values[idx].data,
+                             (u_char *) "httponly", 8) == 0)) {
+            flags |= NGX_HTTP_SESSION_COOKIE_HTTPONLY;
+        } else if ((values[idx].len == 6) &&
+                   (ngx_strncasecmp(values[idx].data,
+                                    (u_char *) "secure", 6) == 0)) {
+            flags |= NGX_HTTP_SESSION_COOKIE_SECURE;
+	} else if ((values[idx].len >= 8) &&
+		   (ngx_strncasecmp(values[idx].data,
+				    (u_char *) "samesite", 8) == 0)) {
+            flags &= ~NGX_HTTP_SESSION_COOKIE_SAMESITE_MASK;
+            if (values[idx].len == 8) {
+                flags |= NGX_HTTP_SESSION_COOKIE_SAMESITE_NONE;
+            } else if ((values[idx].len == 13) &&
+                       (ngx_strncasecmp(values[idx].data + 8,
+                                        (u_char *) "=none", 5) == 0)) {
+                flags |= NGX_HTTP_SESSION_COOKIE_SAMESITE_NONE;
+            } else if ((values[idx].len == 12) &&
+                       (ngx_strncasecmp(values[idx].data + 8,
+                                        (u_char *) "=lax", 4) == 0)) {
+                flags |= NGX_HTTP_SESSION_COOKIE_SAMESITE_LAX;
+            } else if ((values[idx].len == 15) &&
+                       (ngx_strncasecmp(values[idx].data + 8,
+                                        (u_char *) "=strict", 7) == 0)) {
+                flags |= NGX_HTTP_SESSION_COOKIE_SAMESITE_STRICT;
+            } else {
+                return "- invalid session cookie samesite flag specified";
+            }
+        } else {
+            return "- invalid session cookie flags specified";
+        }
+    }
+
+    /* And translate it into the flag string */
+    slcf->cookie_flags.len = 
+             ((flags & NGX_HTTP_SESSION_COOKIE_HTTPONLY) ? 10 : 0) +
+             ((flags & NGX_HTTP_SESSION_COOKIE_SECURE) ? 8 : 0) +
+             ((flags & NGX_HTTP_SESSION_COOKIE_SAMESITE_NONE) ? 15 : 0) +
+             ((flags & NGX_HTTP_SESSION_COOKIE_SAMESITE_LAX) ? 14 : 0) +
+             ((flags & NGX_HTTP_SESSION_COOKIE_SAMESITE_STRICT) ? 17 : 0);
+    slcf->cookie_flags.data = ngx_pcalloc(cf->pool, slcf->cookie_flags.len + 1);
+    if (slcf->cookie_flags.data == NULL) return "memory allocation failure";
+
+    /* Could have just used strcpy but meh */
+    ptr = slcf->cookie_flags.data;
+    if (flags & NGX_HTTP_SESSION_COOKIE_HTTPONLY) {
+        ngx_memcpy(ptr, "; HttpOnly", 10); ptr += 10;
+    }
+    if (flags & NGX_HTTP_SESSION_COOKIE_SECURE) {
+        ngx_memcpy(ptr, "; Secure", 8); ptr += 8;
+    }
+    if (flags & NGX_HTTP_SESSION_COOKIE_SAMESITE_NONE) {
+        ngx_memcpy(ptr, "; SameSite=None", 15); ptr += 15;
+    }
+    if (flags & NGX_HTTP_SESSION_COOKIE_SAMESITE_LAX) {
+        ngx_memcpy(ptr, "; SameSite=Lax", 14); ptr += 14;
+    }
+    if (flags & NGX_HTTP_SESSION_COOKIE_SAMESITE_STRICT) {
+        ngx_memcpy(ptr, "; SameSite=Strict", 17); ptr += 17;
+    }
 
     return NGX_CONF_OK;
 }

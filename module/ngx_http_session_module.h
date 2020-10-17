@@ -43,6 +43,9 @@ typedef struct {
 
     /* Command/action for session control action instances */
     ngx_str_t action;
+
+    /* Other session management options */
+    ngx_str_t cookie_flags;
 } ngx_http_session_loc_conf_t;
 
 /* Associated context information for the upstream manager request handling */

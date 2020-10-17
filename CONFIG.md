@@ -172,3 +172,18 @@ profile to be used for the session management and _action_ is the specific
 action to undertake for this location.  The set of available _action_s is
 determined by the type of associated _profile_, refer to the profile
 documentation for more details on the exact actions available.
+
+### Miscellaneous Directives
+
+Hodgepodge of other directives supported by the nginx-session module as used
+for various functions.
+
+> Syntax: **session_cookie_flags** [_HttpOnly_] [_Secure_] [_SameSite_[=None|Lax|Strict]];  
+> Default: none  
+> Context: main, http, server, location, if  
+
+By default, if the **session_cookie** attribute has been defined, that cookie
+is automatically created by the module on the establishment of a new session.
+This directive controls the various security options for the definition of the
+cookie.  The flag settings are case insensitive, can be specified in any
+order and *do not mix* with flags from higher contexts (to allow overrides).

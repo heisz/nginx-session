@@ -139,11 +139,11 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     ngx_http_upstream_t *upstr = req->upstream;
     ngx_http_session_request_ctx_t *ctx =
                         ngx_http_get_module_ctx(req, ngx_http_session_module);
+    uint16_t type_len, url_len, id_len;
     uint32_t resp_len, buff_len;
-    uint16_t type_len, url_len;
     ngx_table_elt_t *sess_hdr;
+    u_char *ptr, code;
     ngx_int_t cnt;
-    u_char code;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: process header");
@@ -276,11 +276,26 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
             sess_hdr->hash = 1;
             ngx_str_set(&(sess_hdr->key), "Set-Cookie");
             sess_hdr->value.len =
-                   ntohs(*((uint16_t *) (ctx->attributes + 6)));
+                   ctx->slcf->cookie_name.len + 1 + 
+                   (id_len = ntohs(*((uint16_t *) (ctx->attributes + 6)))) +
+                   8 + ctx->slcf->cookie_flags.len;
             sess_hdr->value.data = ngx_palloc(req->pool, sess_hdr->value.len);
             if (sess_hdr->value.data == NULL) return NGX_ERROR;
-            ngx_memcpy(sess_hdr->value.data,
-                       ctx->attributes + 8, sess_hdr->value.len);
+            ptr = sess_hdr->value.data;
+            ngx_memcpy(ptr, ctx->slcf->cookie_name.data,
+                       ctx->slcf->cookie_name.len);
+            ptr += ctx->slcf->cookie_name.len;
+            *(ptr++) = (u_char) '=';
+            ngx_memcpy(ptr, ctx->attributes + 8, id_len);
+            ptr += id_len;
+            /* TODO - handle path and domain */
+            ngx_memcpy(ptr, "; Path=/", 8);
+            ptr += 8;
+            if (ctx->slcf->cookie_flags.len != 0) {
+                ngx_memcpy(ptr, ctx->slcf->cookie_flags.data,
+                           ctx->slcf->cookie_flags.len);
+                ptr += ctx->slcf->cookie_flags.len;
+            }
         }
 
         /* Entire response is just a header set of redirect */
