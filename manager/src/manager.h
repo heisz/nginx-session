@@ -121,6 +121,14 @@ struct NGXMGR_Profile {
     void (*processAction)(NGXMGR_Profile *profile, NGXModuleConnection *conn,
                           char *sourceIpAddr, char *request, char *action,
                           char *sessionId, char *data, int dataLen);
+
+    /* Standard profile configurations trail for static initialization */
+
+    /* The default root index to access if the protocol doesn't define it */
+    char *defaultIndex;
+
+    /* Option for locking session to a source IP address (|| with global) */
+    int sessionIPLocked;
 };
 
 /* Exposed allocation method for creating profiles instances from config */
@@ -136,16 +144,17 @@ typedef struct WXMLLinkedElement {
 void NGXMGR_InitializeSessions();
 char *NGXMGR_GenerateSessionId(int idlen);
 int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
-                           WXBuffer *attrs);
+                           int profileIPLocked, WXBuffer *attrs);
 
 /* Callback definition for asynchronous session completion */
-/* Session id and attributes are internal references, must not block */
+/* All data is internally managed, this method must not block (under lock) */
 typedef void NGXMGR_CompleteSessionHandler(NGXModuleConnection *conn,
                                            char *sessionId,
-                                           WXBuffer *attributes);
+                                           WXBuffer *attributes,
+                                           char *destURL);
 
 void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
-                               WXDictionary *attributes,
+                               WXDictionary *attributes, char *destUrl,
                                NGXModuleConnection *conn,
                                NGXMGR_CompleteSessionHandler handler);
 

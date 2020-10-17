@@ -129,6 +129,67 @@ static int parseFormEncoded(WXHashTable *table, char *data, int len) {
     return TRUE;
 }
 
+/****** Standard/Common Profile Elements ******/
+
+static WXJSONBindDefn stdBindings[] = {
+    { "defaultIndex", WXJSONBIND_STR,
+      offsetof(NGXMGR_Profile, defaultIndex), FALSE },
+    { "sessionIPLocked", WXJSONBIND_BOOLEAN,
+      offsetof(NGXMGR_Profile, sessionIPLocked), FALSE }
+};
+
+#define STD_CFG_COUNT (sizeof(stdBindings) / sizeof(WXJSONBindDefn))
+
+/* Base method for (re)initializing common elements */
+static void StdProfileInit(NGXMGR_Profile *profile, NGXMGR_Profile *template,
+                           const char *profileName, WXJSONValue *config) {
+    char errMsg[1024];
+
+    /* Template is only provided for true initialization */
+    if (template != NULL) {
+        /* Copy the source profile details */
+        *profile = *template;
+        profile->name = profileName;
+
+        /* Pre-initialize the configuration details */
+        profile->defaultIndex = NULL;
+        profile->sessionIPLocked = FALSE;
+    }
+
+    /* Bind the configuration data */
+    if (!WXJSON_Bind(config, profile, stdBindings, STD_CFG_COUNT,
+                     errMsg, sizeof(errMsg))) {
+        /* Nothing here is fatal, just error */
+        WXLog_Error("Profile configuration binding error: %s", errMsg);
+    }
+}
+
+/* Session allocation callback to complete login sequence */
+static void StdSessionEstablishHandler(NGXModuleConnection *conn,
+                                       char *sessionId, WXBuffer *attributes,
+                                       char *destURL) {
+    uint8_t rspBuffer[1024];
+    WXBuffer rsp;
+
+    if (destURL == NULL) destURL = "/index.html";
+    WXBuffer_InitLocal(&rsp, rspBuffer, sizeof(rspBuffer));
+    if ((sessionId == NULL) || 
+            (WXBuffer_Pack(&rsp, "na*c", (uint16_t) strlen(destURL),
+                           destURL, (uint8_t) 0) == NULL) ||
+            (WXBuffer_Append(&rsp, attributes->buffer, attributes->length,
+                             TRUE) == NULL)) {
+        NGXMGR_IssueErrorResponse(conn, 500, "Internal Session Error",
+                                  "Internal error in session allocation");
+    } else {
+        /* Session establish response with redirect */
+        NGXMGR_IssueResponse(conn, NGXMGR_SESSION_ESTABLISH,
+                             rsp.buffer, rsp.length);
+
+        /* Note that mem failure can only occur on attribute buffer attach */
+        WXBuffer_Destroy(&rsp);
+    }
+}
+
 /****** SAML authentication ******/
 
 /**
@@ -162,8 +223,19 @@ typedef struct {
     WXHashTable reqSessions;
 } SAMLProfile;
 
+/**
+ * Tracking structure for original SAML session request, for response
+ * validation (replay) and destination tracking.
+ *
+ * NOTE (here for lack of anywhere else): the SAML protocol supports
+ * the RelayState parameter, which the implementation could use to track
+ * the origin of the SAML request.  But to prevent replay attacks, the
+ * manager needs to track the details of the original session request, so
+ * we store it here.  A future extension could be a configurable set of
+ * RelayState mappings for IdP originated sessions...
+ */
 typedef struct SAMLReqSession {
-    char *reqSessionId;
+    char *reqSessionId, *destURL;
     time_t start;
 } SAMLReqSession;
 
@@ -271,9 +343,8 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         retval = (SAMLProfile *) WXMalloc(sizeof(SAMLProfile));
         if (retval == NULL) return NULL;
 
-        /* Clone the base element details from the static instance */
-        retval->base = SAMLBaseProfile;
-        retval->base.name = profileName;
+        /* Initialize the baseline profile information */
+        StdProfileInit(&(retval->base), &SAMLBaseProfile, profileName, config);
 
         /* Pre-initialize the configuration details/defaults */
         retval->signOnURL = NULL;
@@ -296,6 +367,9 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
             WXFree(retval);
             return NULL;
         }
+    } else {
+        /* Update base configuration */
+        StdProfileInit(orig, NULL, NULL, config);
     }
 
     /* Bind the configuration data */
@@ -388,6 +462,13 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     }
     reqSession->reqSessionId = sessReqId;
     reqSession->start = time((time_t *) NULL);
+    if (strncmp(request, "GET ", 4) == 0) {
+        reqSession->destURL = (char *) WXMalloc(strlen(request) + 1);
+        if (reqSession->destURL == NULL) goto memfail;
+        (void) strcpy(reqSession->destURL, request + 4);
+    } else {
+        /* Fall back to the conifigured default index */
+    }
     if (!WXHash_PutEntry(&(profile->reqSessions), sessReqId, reqSession,
                          NULL, NULL, WXHash_StrHashFn, WXHash_StrEqualsFn)) {
         goto memfail;
@@ -529,6 +610,7 @@ memfail:
         (void) WXHash_RemoveEntry(&(profile->reqSessions),
                                   reqSession->reqSessionId, NULL, NULL,
                                   WXHash_StrHashFn, WXHash_StrEqualsFn);
+        if (reqSession->destURL != NULL) WXFree(reqSession->destURL);
         WXFree(reqSession->reqSessionId);
         WXFree(reqSession);
     }
@@ -574,31 +656,6 @@ static time_t parseRTT(char *which, char *tmstr) {
            atoi(tmstr + 17);
 }
 
-/* Session allocation callback to complete login sequence */
-static void SAMLLoginSessionHandler(NGXModuleConnection *conn,
-                                    char *sessionId, WXBuffer *attributes) {
-    char *url = "/index.html";
-    uint8_t rspBuffer[1024];
-    WXBuffer rsp;
-
-    WXBuffer_InitLocal(&rsp, rspBuffer, sizeof(rspBuffer));
-    if ((sessionId == NULL) || 
-            (WXBuffer_Pack(&rsp, "na*c", (uint16_t) strlen(url), url,
-                           (uint8_t) 0) == NULL) ||
-            (WXBuffer_Append(&rsp, attributes->buffer, attributes->length,
-                             TRUE) == NULL)) {
-        NGXMGR_IssueErrorResponse(conn, 500, "Internal Session Error",
-                                  "Internal error in session allocation");
-    } else {
-        /* Session establish response with redirect */
-        NGXMGR_IssueResponse(conn, NGXMGR_SESSION_ESTABLISH,
-                             rsp.buffer, rsp.length);
-
-        /* Note that mem failure can only occur on attribute buffer attach */
-        WXBuffer_Destroy(&rsp);
-    }
-}
-
 /* Process SAML commands, establish login completion or logout */
 static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                       char *sourceIpAddr, char *data, int dataLen) {
@@ -610,6 +667,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     SAMLReqSession *reqSession;
     WXDictionary attributes;
     WXHashTable postData;
+    char *destURL = NULL;
     WXMLAttribute *attr;
     const char *key;
     time_t tm;
@@ -773,10 +831,11 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                 WXLog_Warn("Unsolicited or replay Assertion, skipping");
                 conf = NULL;
             } else {
-                /* TODO - need to track any of the underlying content? */
                 (void) WXHash_RemoveEntry(&(profile->reqSessions), attr->value,
                                           NULL, NULL, WXHash_StrHashFn,
                                           WXHash_StrEqualsFn);
+                /* Steal the destination for use in the redirect */
+                destURL = reqSession->destURL;  reqSession->destURL = NULL;
                 WXFree(reqSession->reqSessionId);
                 WXFree(reqSession);
             }
@@ -850,11 +909,14 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
 
         /* Finally!  Generate a session instance */
         /* TODO - handle externally specified exiry time */
-        NGXMGR_AllocateNewSession(sourceIpAddr, -1, &attributes, conn,
-                                  SAMLLoginSessionHandler);
+        NGXMGR_AllocateNewSession(sourceIpAddr, -1, &attributes,
+                                  (destURL != NULL) ? destURL :
+                                                      prf->defaultIndex,
+                                  conn, StdSessionEstablishHandler);
     }
 
     /* Cleanup */
+    if (destURL != NULL) WXFree(destURL);
     WXDict_Destroy(&attributes);
     if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
     freeEncodedData(&postData);
@@ -863,6 +925,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     return;
 
 samlerr:
+    if (destURL != NULL) WXFree(destURL);
     if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
     if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
     freeEncodedData(&postData);
@@ -873,6 +936,7 @@ samlerr:
 
 memfail:
     WXLog_Error("Memory allocation failure in SAML response processing");
+    if (destURL != NULL) WXFree(destURL);
     if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
     if (postData.entries != NULL) freeEncodedData(&postData);
     if (base64Buff != NULL) BIO_free_all(base64Buff);

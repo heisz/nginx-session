@@ -363,6 +363,7 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
         /* Validate session up front, so we can log determined state */
         WXBuffer_InitLocal(&sessionAttrs, attrBuff, sizeof(attrBuff));
         sessionIsValid = NGXMGR_ValidateSession(sessionId, sourceIpAddr,
+                                                profile->sessionIPLocked,
                                                 &sessionAttrs);
 
         /* Generate session log entry if enabled */

@@ -97,7 +97,7 @@ char *NGXMGR_GenerateSessionId(int idlen) {
 
 /* Validate the indicated session, taking lifespan and source IP into account */
 int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
-                           WXBuffer *attrs) {
+                           int profileIPLocked, WXBuffer *attrs) {
     time_t currentTm = time((time_t *) NULL);
     NGXMGRSession *session = NULL;
     int sessionIsValid = FALSE;
@@ -113,7 +113,7 @@ int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
                                          GlobalData.sessionIdleTime))) {
             /* Session has expired or is inactive */
             sessionIsValid = FALSE;
-        } else if (GlobalData.sessionIPLocked) {
+        } else if (GlobalData.sessionIPLocked || profileIPLocked) {
             /* Session is valid only if IP address has not changed */
             sessionIsValid = (strcmp(session->sourceIpAddr, sourceIpAddr) == 0);
         } else {
@@ -161,10 +161,11 @@ static int encodeAttribute(WXDictionary *dict, const char *key,
 
 /* Allocate a session instance, based on external authentication actions */
 void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
-                               WXDictionary *attributes,
+                               WXDictionary *attributes, char *destURL,
                                NGXModuleConnection *conn,
                                NGXMGR_CompleteSessionHandler handler) {
     NGXMGRSession *session;
+    char *dst = NULL;
 
     /* Build the session tracking instance */
     session = (NGXMGRSession *) WXCalloc(sizeof(NGXMGRSession));
@@ -172,6 +173,7 @@ void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
     session->sessionId = NGXMGR_GenerateSessionId(GlobalData.sessionIdLen);
     if (session->sessionId == NULL) goto memfail;
     session->sourceIpAddr = (char *) WXMalloc(strlen(sourceIpAddr) + 1);
+    if (session->sourceIpAddr == NULL) goto memfail;
     (void) strcpy(session->sourceIpAddr, sourceIpAddr);
     session->established = session->lastAccess = time((time_t *) NULL);
     if (GlobalData.sessionLifespan >= 0) {
@@ -189,6 +191,12 @@ void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
     if (WXDict_Scan(attributes, encodeAttribute, 
                     &(session->attributes))) goto memfail;
 
+    /* Duplicate the destination for thread safety */
+    if (destURL == NULL) destURL = "/index.html";
+    dst = (char *) WXMalloc(strlen(destURL) + 1);
+    if (dst == NULL) goto memfail;
+    (void) strcpy(dst, destURL);
+
     /* Record it appropriately */
     if (GlobalData.dbConnPool != NULL) {
         /* TODO - database storage with callback */
@@ -203,17 +211,19 @@ void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
         }
 
         /* Note: callback handler must not block, under session lock! */
-        (*handler)(conn, session->sessionId, &(session->attributes));
+        (*handler)(conn, session->sessionId, &(session->attributes), dst);
         (void) WXThread_MutexUnlock(&sessionsLock);
+        WXFree(dst);
     }
     return;
 
 memfail:
     WXLog_Error("Memory allocation failure on creating session record");
+    if (dst != NULL) WXFree(dst);
     if (session->attributes.buffer != NULL)
                         WXBuffer_Destroy(&(session->attributes));
     if (session->sourceIpAddr != NULL) WXFree(session->sourceIpAddr);
     if (session->sessionId != NULL) WXFree(session->sessionId);
     if (session != NULL) WXFree(session);
-    (*handler)(conn, NULL, NULL);
+    (*handler)(conn, NULL, NULL, destURL);
 }
