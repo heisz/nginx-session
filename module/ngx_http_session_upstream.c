@@ -128,6 +128,68 @@ static ngx_int_t ngx_http_session_validate_strlist(u_char *ptr, uint32_t len,
 }
 
 /**
+ * Ugh, another long problem with a somewhat ugly solution.  Originally the
+ * idea was to store the attributes in the module context.  However, when an
+ * internal redirect (either @ or an explicit URI) occurs, the Nginx core
+ * flushes all module context references in preparation for a new processing
+ * chain.  For the upstream header variables, this works because the upstream
+ * reference is persisted.  But injecting fake headers into the upstream isn't
+ * much better and won't work if local caching is put in place to extract
+ * session details without manager communication.  So the next best thing is
+ * to add the attributes to the request cleanup managed chain and identify it
+ * by the cleanup handler.
+ */
+static void ngx_http_session_attribute_cleaner(void *data) {
+    /* Nothing to do, allocated from request pool, I'm just the marker */
+}
+
+static ngx_int_t ngx_http_session_push_attributes(ngx_http_request_t *req,
+                                                  ngx_str_t *attrs) {
+    ngx_http_cleanup_t *rec = req->cleanup;
+
+    /* Create a bundled string value for the attribute list */
+    ngx_str_t *data = (ngx_str_t *) ngx_palloc(req->pool,
+                                               sizeof(ngx_str_t) + attrs->len);
+    if (data == NULL) return NGX_ERROR;
+    data->data = ((u_char *) data) + sizeof(ngx_str_t);
+    data->len = attrs->len;
+    ngx_memcpy(data->data, attrs->data, attrs->len);
+
+    /* Find an existing record, in case of update */
+    while (rec != NULL) {
+        if (rec->handler == &ngx_http_session_attribute_cleaner) break;
+        rec = rec->next;
+    }
+
+    if (rec != NULL) {
+        rec->data = data;
+    } else {
+        rec = ngx_palloc(req->pool, sizeof(ngx_http_cleanup_t));
+        if (rec == NULL) return NGX_ERROR;
+
+        rec->handler = &ngx_http_session_attribute_cleaner;
+        rec->data = data;
+        rec->next = req->cleanup;
+        req->cleanup = rec;
+    }
+
+    return NGX_OK;
+}
+
+ngx_str_t *ngx_http_get_session_attributes(ngx_http_request_t *req) {
+    ngx_http_cleanup_t *rec = req->cleanup;
+
+    while (rec != NULL) {
+        if (rec->handler == &ngx_http_session_attribute_cleaner) {
+            return (ngx_str_t *) rec->data;
+        }
+        rec = rec->next;
+    }
+
+    return NULL;
+}
+
+/**
  * Parse the response information from the manager, translating it into
  * an upstream response for handing off/back to the module instance.
  *
@@ -142,6 +204,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
     uint16_t type_len, url_len, id_len;
     uint32_t resp_len, buff_len;
     ngx_table_elt_t *sess_hdr;
+    ngx_str_t attributes;
     u_char *ptr, code;
     ngx_int_t cnt;
 
@@ -229,6 +292,15 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
                     "X-Accel-Redirect");
         upstr->headers_in.x_accel_redirect->value =
                                 ctx->slcf->valid_redirect_target;
+
+        /* Push the context attribute information for variable lookup */
+        attributes.data = upstr->buffer.pos + 4;
+        attributes.len = resp_len;
+        if (ngx_http_session_push_attributes(req, &attributes) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        /* Complete the upstream, discard the remainder */
         upstr->headers_in.content_length_n = 0;
         upstr->headers_in.status_n = NGX_HTTP_OK;
         upstr->buffer.pos += 4 + resp_len;
@@ -262,12 +334,12 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         ngx_memcpy(req->headers_out.location->value.data,
                    upstr->buffer.pos + 6, url_len);
 
-        /* Define the context attribute set */
-        ctx->attributes_length = resp_len - url_len - 7;
-        ctx->attributes = ngx_palloc(req->pool, ctx->attributes_length);
-        if (ctx->attributes == NULL) return NGX_ERROR;
-        (void) memcpy(ctx->attributes, upstr->buffer.pos + url_len + 7,
-                      ctx->attributes_length);
+        /* Push the context attribute information for variable lookup */
+        attributes.data = upstr->buffer.pos + url_len + 7;
+        attributes.len = resp_len - url_len - 3;
+        if (ngx_http_session_push_attributes(req, &attributes) != NGX_OK) {
+            return NGX_ERROR;
+        }
 
         /* Push the session cookie if defined (first attribute named sid) */
         if (ctx->slcf->cookie_name.len != 0) {
@@ -277,7 +349,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
             ngx_str_set(&(sess_hdr->key), "Set-Cookie");
             sess_hdr->value.len =
                    ctx->slcf->cookie_name.len + 1 + 
-                   (id_len = ntohs(*((uint16_t *) (ctx->attributes + 6)))) +
+                   (id_len = ntohs(*((uint16_t *) (attributes.data + 6)))) +
                    8 + ctx->slcf->cookie_flags.len;
             sess_hdr->value.data = ngx_palloc(req->pool, sess_hdr->value.len);
             if (sess_hdr->value.data == NULL) return NGX_ERROR;
@@ -286,7 +358,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
                        ctx->slcf->cookie_name.len);
             ptr += ctx->slcf->cookie_name.len;
             *(ptr++) = (u_char) '=';
-            ngx_memcpy(ptr, ctx->attributes + 8, id_len);
+            ngx_memcpy(ptr, attributes.data + 8, id_len);
             ptr += id_len;
             /* TODO - handle path and domain */
             ngx_memcpy(ptr, "; Path=/", 8);

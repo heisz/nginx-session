@@ -312,36 +312,34 @@ static ngx_str_t var_pfx = ngx_string("ngxssn_");
 static ngx_int_t ngx_http_session_var(ngx_http_request_t *req,
                                       ngx_http_variable_value_t *var,
                                       uintptr_t data) {
-    ngx_http_session_request_ctx_t *ctx;
     ngx_str_t *name = (ngx_str_t *) data;
     ngx_int_t len, vlen = name->len - var_pfx.len;
     u_char *ptr, *arg = name->data + var_pfx.len;
+    ngx_str_t *attributes = NULL;
     uint16_t l;
 
     /* Ensure we are in response context and variables are defined */
-    if (((ctx = ngx_http_get_module_ctx(req,
-                                        ngx_http_session_module)) == NULL) ||
-            (ctx->request == NULL) || (ctx->attributes == NULL)) {
+    if ((attributes = ngx_http_get_session_attributes(req)) == NULL) {
         var->not_found = 1;
         return NGX_OK;
     }
 
     /* Otherwise parse the attributes for the variable suffix */
     /* Note that the content was validated during the original receipt/copy */
-    ptr = ctx->attributes;
-    len = ctx->attributes_length;
+    ptr = (u_char *) attributes->data;
+    len = attributes->len;
     while (len > 0) {
         l = ntohs(*((uint16_t *) ptr));
         if ((l == vlen) && (memcmp(ptr + 2, arg, vlen) == 0)) {
             var->data = ptr + l + 5;
-            var->len = ntohs(*((uint16_t *) ptr + l + 3));
+            var->len = ntohs(*((uint16_t *) (ptr + l + 3)));
             var->valid = 1;
             var->no_cacheable = 0;
             var->not_found = 0;
             return NGX_OK;
         }
 
-        l += ntohs(*((uint16_t *) ptr + l + 3)) + 6;
+        l += ntohs(*((uint16_t *) (ptr + l + 3))) + 6;
         ptr += l;
         len -= l;
     }
@@ -998,8 +996,6 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     /* Attach to the request context */
     ctx->request = req;
     ctx->slcf = slcf;
-    ctx->attributes = NULL;
-    ctx->attributes_length = 0;
     ngx_http_set_ctx(req, ctx, ngx_http_session_module);
 
     /* Generate/push to the upstream data instance, with POST handling */

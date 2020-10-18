@@ -59,15 +59,14 @@ typedef struct {
     /* The outbound manager request content */
     uint8_t *request_content;
     uint32_t request_length;
-
-    /* Manager variable/attribute response information */
-    u_char *attributes;
-    uint32_t attributes_length;
 } ngx_http_session_request_ctx_t;
 
 /* Exposed method to create the upstream request instance */
 ngx_int_t ngx_http_session_create_upstream(ngx_http_session_loc_conf_t *smcf,
                                            ngx_http_request_t *req,
                                            ngx_http_session_request_ctx_t *ctx);
+
+/* Likewise, access method for any session attributes defined for the request */
+ngx_str_t *ngx_http_get_session_attributes(ngx_http_request_t *req);
 
 #endif

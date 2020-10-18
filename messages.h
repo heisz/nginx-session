@@ -82,14 +82,14 @@ typedef enum NGXMGR_Response {
     NGXMGR_RESPONSE_PENDING = 0x00,
 
     /*
-     * VALIDATE_SESSION response when the session is invalid but no action is
+     * VALIDATE/VERIFY response when the session is invalid but no action is
      * to be taken by the module.  There is no additional content with this
      * response, all directives are managed by the nginx configuration.
      */
     NGXMGR_SESSION_INVALID = 0x01,
 
     /*
-     * VALIDATE_SESSION response when the session is valid and processing
+     * VALIDATE/VERIFY response when the session is valid and processing
      * can continue (redirect by the nginx module).  Remaining content is a
      * set of length-encoded pairs of strings, which represent any nginx
      * variables to be defined based on the underlying session information.
