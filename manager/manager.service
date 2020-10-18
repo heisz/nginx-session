@@ -1,0 +1,18 @@
+#
+# Systemd configuration file for the Nginx session manager.
+# Copy to /etc/systemd/system to access.
+#
+[Unit]
+Description=Nginx Session Manager
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/sessmgr.pid
+ExecStart=ngxsessmgr -r /var
+ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/5 --pidfile /var/run/t1labs-nginx.pid
+TimeoutStopSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
