@@ -141,6 +141,7 @@ int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
     /* Handle cleanup (including database flush) outside of lock */
     if ((!sessionIsValid) && (session != NULL)) {
         /* TODO - database flush! */
+        WXBuffer_Destroy(&(session->attributes));
         WXFree(session->sessionId);
         WXFree(session->sourceIpAddr);
         WXFree(session);
