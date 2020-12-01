@@ -41,7 +41,9 @@ typedef struct {
     char *dataSourceName;
     char *dbUser, *dbPasswd;
 
-    /* Configuration-driven logging filename */
+    /* Configuration-driven logging filenames */
+    char *pidFileName;
+    char *managerLogFileName;
     char *sessionLogFileName;
 
     /* Session management options */

@@ -69,6 +69,8 @@ NGXMGRGlobalDataType GlobalData = {
     /* dbUser = */ NULL,
     /* dbPasswd = */ NULL,
 
+    /* pidFileName = */ NULL,
+    /* managerLogFileName = */ NULL,
     /* sessionLogFileName = */ NULL,
 
     /* sessionIdLen = */ 64,
@@ -117,6 +119,10 @@ static WXJSONBindDefn cfgBindings[] = {
     { "session.ipLocked", WXJSONBIND_BOOLEAN,
       offsetof(NGXMGRGlobalDataType, sessionIPLocked), FALSE },
 
+    { "pidFile", WXJSONBIND_STR,
+      offsetof(NGXMGRGlobalDataType, pidFileName), FALSE },
+    { "managerLogFile", WXJSONBIND_STR,
+      offsetof(NGXMGRGlobalDataType, managerLogFileName), FALSE },
     { "sessionLogFile", WXJSONBIND_STR,
       offsetof(NGXMGRGlobalDataType, sessionLogFileName), FALSE }
 };
@@ -323,8 +329,12 @@ int main(int argc, char **argv) {
 
     /* Switch to a daemon, unless indicated otherwise */
     if (daemonMode) {
-        daemonStart(rootDir, "SMGR", "/var/run/sessmgr.pid",
-                    "/var/log/sessmgr.log", coreSignalHandler);
+        daemonStart(rootDir, "SMGR",
+                    ((GlobalData.pidFileName != NULL) ?
+                        GlobalData.pidFileName : "/var/run/sessmgr.pid"),
+                    ((GlobalData.managerLogFileName != NULL) ?
+                        GlobalData.managerLogFileName : "/var/log/sessmgr.log"),
+                    coreSignalHandler);
     } else {
         WXLog_Init("SMGR", NULL);
     }
