@@ -131,6 +131,9 @@ struct NGXMGR_Profile {
 
     /* Option for locking session to a source IP address (|| with global) */
     int sessionIPLocked;
+
+    /* Mapping/lookup object to get extended attributes */
+    WXDictionary extAttributes;
 };
 
 /* Exposed allocation method for creating profiles instances from config */
@@ -155,7 +158,7 @@ typedef void NGXMGR_CompleteSessionHandler(NGXModuleConnection *conn,
                                            WXBuffer *attributes,
                                            char *destURL);
 
-void NGXMGR_AllocateNewSession(char *sourceIpAddr, time_t expiry,
+void NGXMGR_AllocateNewSession(int userId, char *sourceIpAddr, time_t expiry,
                                WXDictionary *attributes, char *destUrl,
                                NGXModuleConnection *conn,
                                NGXMGR_CompleteSessionHandler handler);

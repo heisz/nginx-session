@@ -140,9 +140,24 @@ static WXJSONBindDefn stdBindings[] = {
 
 #define STD_CFG_COUNT (sizeof(stdBindings) / sizeof(WXJSONBindDefn))
 
+static int extAttrScanner(WXHashTable *table, void *key, void *obj,
+                          void *userData) {
+    WXDictionary *extAttr = (WXDictionary *) userData;
+    WXJSONValue *val = (WXJSONValue *) obj;
+
+    if (val->type == WXJSONVALUE_STRING) {
+        if (!WXDict_PutEntry(extAttr, (char *) key, val->value.sval)) {
+            WXLog_Error("Memory failure defining external attribute map");
+        }
+    } else {
+        WXLog_Error("Invalid externalAttributes entry, must be string:string");
+    }
+}
+
 /* Base method for (re)initializing common elements */
 static void StdProfileInit(NGXMGR_Profile *profile, NGXMGR_Profile *template,
                            const char *profileName, WXJSONValue *config) {
+    WXJSONValue *extAttr;
     char errMsg[1024];
 
     /* Template is only provided for true initialization */
@@ -154,6 +169,7 @@ static void StdProfileInit(NGXMGR_Profile *profile, NGXMGR_Profile *template,
         /* Pre-initialize the configuration details */
         profile->defaultIndex = NULL;
         profile->sessionIPLocked = FALSE;
+        WXDict_Init(&(profile->extAttributes), 0, TRUE);
     }
 
     /* Bind the configuration data */
@@ -161,6 +177,17 @@ static void StdProfileInit(NGXMGR_Profile *profile, NGXMGR_Profile *template,
                      errMsg, sizeof(errMsg))) {
         /* Nothing here is fatal, just error */
         WXLog_Error("Profile configuration binding error: %s", errMsg);
+    }
+
+    /* Extended attributes is a bit more convoluted (convert and persist) */
+    extAttr = WXJSON_Find(config, "extendedAttributes");
+    if (extAttr != NULL) {
+        if (extAttr->type != WXJSONVALUE_OBJECT) {
+            WXLog_Error("Invalid externalAttributes value, expecting object");
+        } else {
+            (void) WXHash_Scan(&(extAttr->value.oval),
+                               extAttrScanner, &(profile->extAttributes));
+        }
     }
 }
 
@@ -656,6 +683,125 @@ static time_t parseRTT(char *which, char *tmstr) {
            atoi(tmstr + 17);
 }
 
+/* Asynchronous data carrier and method for database verification */
+typedef struct {
+    NGXMGR_Profile *prf;
+    NGXModuleConnection *conn;
+    char sourceIpAddr[64];
+    char *destURL;
+    WXDictionary attributes;
+
+    /* Local processing objects for verify generation and handling */
+    WXBuffer cmdbuff;
+    WXArray extAttrKeys;
+} SAMLLoginInfo;
+
+int extAttrFieldCB(WXHashTable *table, void *key, void *obj, void *userData) {
+    SAMLLoginInfo *info = (SAMLLoginInfo *) userData;
+    char *field = (char *) key;
+
+    if ((WXBuffer_Append(&(info->cmdbuff), ", ", 2, TRUE) == NULL) ||
+            (WXBuffer_Append(&(info->cmdbuff), field, strlen(field),
+                             TRUE) == NULL)) {
+        return 1;
+    }
+    if (WXArray_Push(&(info->extAttrKeys), &obj) == NULL) return 1;
+
+    return 0;
+}
+
+static void *samlLoginFinish(void *arg) {
+    SAMLLoginInfo *info = (SAMLLoginInfo *) arg;
+    WXBuffer *cmdbuff = &(info->cmdbuff);
+    WXDBConnection *dbconn = NULL;
+    WXDBResultSet *rs = NULL;
+    int userId, idx;
+    char *uid, *val;
+
+    /* Query to extract the userId and extended attributes */
+    if (WXBuffer_Init(cmdbuff, 1024) == NULL) goto memfail;
+    if (WXArray_Init(&(info->extAttrKeys), char *, 16) == NULL) goto memfail;
+    (void) WXBuffer_Append(cmdbuff, "SELECT user_id", 14, TRUE);
+    if (WXHash_Scan(&(info->prf->extAttributes.base),
+                    extAttrFieldCB, info) != 0) goto memfail;
+    if (WXBuffer_Append(cmdbuff,
+                        " FROM ngxsessionmgr.users"
+                        " WHERE active = 't' AND external_auth_id = '",
+                        25 + 44, TRUE) == NULL) goto memfail;
+    uid = (char *) WXDict_GetEntry(&(info->attributes), "uid");
+    while (*uid != '\0') {
+        if (*uid == '\'') {
+            if (WXBuffer_Append(cmdbuff, "\\", 1, TRUE) == NULL) goto memfail;
+        }
+        if (WXBuffer_Append(cmdbuff, uid, 1, TRUE) == NULL) goto memfail;
+        uid++;
+    }
+    if (WXBuffer_Append(cmdbuff, "'\0", 2, TRUE) == NULL) goto memfail;
+
+    /* Issue query and validate/extract user information */
+    dbconn = WXDBConnectionPool_Obtain(GlobalData.dbConnPool);
+    if (dbconn == NULL) {
+        WXLog_Error("Failed to obtain connection for user verification");
+        goto verifyfail;
+    }
+
+    rs = WXDBConnection_ExecuteQuery(dbconn, cmdbuff->buffer);
+    if (rs == NULL) {
+       WXLog_Error("Unexpected error validating user information: %s",
+                    WXDB_GetLastErrorMessage(dbconn));
+       goto verifyfail;
+    }
+
+    /* Presumes exactly one row, read first only */
+    if (!WXDBResultSet_NextRow(rs)) {
+        WXLog_Error("SAML authenticated identity '%s' but not defined/active",
+                    (char *) WXDict_GetEntry(&(info->attributes), "uid"));
+        NGXMGR_IssueErrorResponse(info->conn, 403, "Invalid User",
+                           "User externally validated but not defined/active");
+        goto cleanup;
+    }
+
+    /* Woohoo!  User validated, extract associated attributes */
+    userId = atol(WXDBResultSet_ColumnData(rs, 0));
+    for (idx = 0; idx < info->extAttrKeys.length; idx++) {
+        if (!WXDBResultSet_ColumnIsNull(rs, idx + 1)) {
+            if (!WXDict_PutEntry(&(info->attributes),
+                                 ((char **)info->extAttrKeys.array)[idx],
+                                 WXDBResultSet_ColumnData(rs, idx + 1))) {
+                goto memfail;
+            }
+        }
+    }
+
+    /* And issue the session instance */
+    NGXMGR_AllocateNewSession(userId, info->sourceIpAddr, -1,
+                              &(info->attributes),
+                              (info->destURL != NULL) ? info->destURL :
+                                                        info->prf->defaultIndex,
+                              info->conn, StdSessionEstablishHandler);
+
+cleanup:
+    if (rs != NULL) WXDBResultSet_Close(rs);
+    if (dbconn != NULL) WXDBConnectionPool_Return(dbconn);
+    WXArray_Destroy(&(info->extAttrKeys));
+    WXBuffer_Destroy(&(info->cmdbuff));
+    if (info->destURL != NULL) WXFree(info->destURL);
+    WXDict_Destroy(&(info->attributes));
+    WXFree(info);
+    return NULL;
+
+memfail:
+    WXLog_Error("Memory allocation failure in SAML login completion");
+    NGXMGR_IssueErrorResponse(info->conn, 500, "Memory Error",
+                       "Internal Error: Manager memory allocation error");
+    goto cleanup;
+
+verifyfail:
+    NGXMGR_IssueErrorResponse(info->conn, 403, "User Verify Error",
+                       "Internal Error: Unable to verify user information");
+    goto cleanup;
+}
+
 /* Process SAML commands, establish login completion or logout */
 static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                       char *sourceIpAddr, char *data, int dataLen) {
@@ -669,6 +815,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     WXHashTable postData;
     char *destURL = NULL;
     WXMLAttribute *attr;
+    SAMLLoginInfo *info;
     const char *key;
     time_t tm;
     int len;
@@ -907,17 +1054,38 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             nameId = ptr;
         }
 
-        /* Finally!  Generate a session instance */
-        /* TODO - handle externally specified exiry time */
-        NGXMGR_AllocateNewSession(sourceIpAddr, -1, &attributes,
-                                  (destURL != NULL) ? destURL :
-                                                      prf->defaultIndex,
-                                  conn, StdSessionEstablishHandler);
+        /* DB dependent, immediately assign session or validate uid */
+        /* TODO - handle externally specified expiry time */
+        if (GlobalData.dbConnPool == NULL) {
+            NGXMGR_AllocateNewSession(-1, sourceIpAddr, -1, &attributes,
+                                      (destURL != NULL) ? destURL :
+                                                          prf->defaultIndex,
+                                      conn, StdSessionEstablishHandler);
+        } else {
+            /* Hand off to the worker process for database interaction */
+            info = (SAMLLoginInfo *) WXCalloc(sizeof(SAMLLoginInfo));
+            if (info == NULL) goto memfail;
+            info->prf = prf;
+            info->conn = conn;
+            (void) strcpy(info->sourceIpAddr, sourceIpAddr);
+            info->destURL = destURL;
+            info->attributes = attributes;
+
+            if (WXThreadPool_Enqueue(GlobalData.workerThreadPool,
+                                     samlLoginFinish, info) < 0) {
+                WXLog_Error("Failed to issue worker for login completion");
+                WXFree(info);
+            } else {
+                /* Nullify to prevent cleanup mucking up handoff */
+                destURL = NULL;
+                (void) memset(&attributes, 0, sizeof(WXDictionary));
+            }
+        }
     }
 
     /* Cleanup */
     if (destURL != NULL) WXFree(destURL);
-    WXDict_Destroy(&attributes);
+    if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
     if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
     freeEncodedData(&postData);
     WXML_Destroy(root);
