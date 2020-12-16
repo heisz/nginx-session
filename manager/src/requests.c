@@ -14,7 +14,7 @@
 #include "mem.h"
 
 /* Define this to trace messaging */
-#define NGXMGR_TRACE_MSG 1
+// #define NGXMGR_TRACE_MSG 1
 
 /**
  * Allocate and register a new module connection instance for request handling.

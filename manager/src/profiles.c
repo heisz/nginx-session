@@ -858,8 +858,8 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         return;
     }
 
-    /* TODO -remove when stable */
-    logXML(root);
+    /* Enable this to trace SAML XML data exchange */
+    // logXML(root);
 
     /* First, determine the validated references up front (if enabled) */
     if (profile->idpCertificate != NULL) {
