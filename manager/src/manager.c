@@ -1,7 +1,7 @@
 /**
  * Primary NGINX session management daemon entry point.
  *
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2021 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -242,7 +242,7 @@ static void parseConfiguration(int isReload) {
     }
     if (GlobalData.sessionLogFileName != NULL) {
         GlobalData.sessionLogFile =
-                         fopen(GlobalData.sessionLogFileName, "a");
+                         fopen(GlobalData.sessionLogFileName, "a+");
         if (GlobalData.sessionLogFile == NULL) {
             WXLog_Error("Unable to open logging file: %s", strerror(errno));
         }
@@ -335,6 +335,13 @@ int main(int argc, char **argv) {
                     ((GlobalData.managerLogFileName != NULL) ?
                         GlobalData.managerLogFileName : "/var/log/sessmgr.log"),
                     coreSignalHandler);
+
+        /* Note that daemonizing will have closed the session file */
+        if (GlobalData.sessionLogFile != NULL) {
+            (void) fclose(GlobalData.sessionLogFile);
+            GlobalData.sessionLogFile =
+                             fopen(GlobalData.sessionLogFileName, "a+");
+        }
     } else {
         WXLog_Init("SMGR", NULL);
     }
@@ -344,6 +351,7 @@ int main(int argc, char **argv) {
     WXLog_Info("Build: %s%s%s", CONFIGUREDATE,
                ((strlen(BUILDLABEL) == 0) ? "" : " - "),
                BUILDLABEL);
+    NGXMGR_SessionLog("Manager restarted");
 
     /* Open the bind socket, must be exclusive access */
     svc = (GlobalData.svcBindService == NULL) ? "5344" :

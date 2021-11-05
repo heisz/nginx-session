@@ -1,7 +1,7 @@
 /**
  * What it's all about, managing session instances!
  * 
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2021 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -12,6 +12,28 @@
 #include "thread.h"
 #include "log.h"
 #include "mem.h"
+
+/* Shared method for logging messages to the session log */
+#define SESSION_LOG_LIMIT 4096
+void NGXMGR_SessionLog(const char *format, ...) {
+    char message[SESSION_LOG_LIMIT];
+    va_list ap;
+    int len;
+
+    if (GlobalData.sessionLogFile != NULL) {
+        WXLog_GetFormattedTimestamp(message);
+        len = strlen(message);
+        message[len++] = ' ';
+        va_start(ap, format);
+        len += vsnprintf(message + len, SESSION_LOG_LIMIT - len, format, ap);
+        va_end(ap);
+        if (len > SESSION_LOG_LIMIT - 3) len = SESSION_LOG_LIMIT - 3;
+        (void) strcpy(message + len, "\n");
+
+        (void) fprintf(GlobalData.sessionLogFile, "%s", message);
+        (void) fflush(GlobalData.sessionLogFile);
+    }
+}
 
 /* Tracking structure for active session instances */
 typedef struct NGXMGRSession {
@@ -235,15 +257,26 @@ int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
     session = WXHash_GetEntry(&sessions, sessionId, WXHash_StrHashFn,
                               WXHash_StrEqualsFn);
     if (session != NULL) {
-        if ((currentTm > session->expiry) ||
-                ((GlobalData.sessionIdleTime > 0) &&
-                     ((currentTm - session->lastAccess) >
-                                         GlobalData.sessionIdleTime))) {
-            /* Session has expired or is inactive */
+        if (currentTm > session->expiry) {
+            /* Max session lifespan */
+            NGXMGR_SessionLog("[%s:%s] session expired",
+                              sessionId, sourceIpAddr);
+            sessionIsValid = FALSE;
+        } else if ((GlobalData.sessionIdleTime > 0) &&
+                       ((currentTm - session->lastAccess) >
+                                           GlobalData.sessionIdleTime)) {
+            /* Idle timeout */
+            NGXMGR_SessionLog("[%s:%s] idle session timeout",
+                              sessionId, sourceIpAddr);
             sessionIsValid = FALSE;
         } else if (GlobalData.sessionIPLocked || profileIPLocked) {
             /* Session is valid only if IP address has not changed */
             sessionIsValid = (strcmp(session->sourceIpAddr, sourceIpAddr) == 0);
+            if (!sessionIsValid) {
+                NGXMGR_SessionLog("[%s:%s] session moved (was %s)",
+                                  sessionId, sourceIpAddr,
+                                  session->sourceIpAddr);
+            }
         } else {
             /* Session is valid, even if on the move */
             sessionIsValid = TRUE;
@@ -392,6 +425,11 @@ void NGXMGR_AllocateNewSession(int userId, char *sourceIpAddr, time_t expiry,
         (*handler)(conn, NULL, NULL, destURL);
         return;
     }
+
+    /* Track for audit and debugging */
+    NGXMGR_SessionLog("[%s:%s] session established (expiry: %lld s)",
+                      session->sessionId, sourceIpAddr,
+                      (long long) (session->expiry - session->established));
 
     /* Note: callback handler must not block, under session lock! */
     (*handler)(conn, session->sessionId, &(session->attributes), destURL);

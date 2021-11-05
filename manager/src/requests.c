@@ -1,7 +1,7 @@
 /**
  * Methods for handling the various requests to the session manager.
  * 
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2021 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -368,15 +368,10 @@ void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events) {
 
         /* Generate session log entry if enabled */
         if (GlobalData.sessionLogFile != NULL) {
-            WXLog_GetFormattedTimestamp(timestamp);
-
-            (void) fprintf(GlobalData.sessionLogFile,
-                           "%s %s%s%s[%s:%s->%s] %s\n",
-                           timestamp, profile->name,
-                           ((action != NULL) ? ":" : ""), action,
-                           sessionId, sourceIpAddr,
-                           ((sessionIsValid) ? "Y" : "N"), request);
-            (void) fflush(GlobalData.sessionLogFile);
+            NGXMGR_SessionLog("%s%s%s[%s:%s->%s] %s", profile->name,
+                              ((action != NULL) ? ":" : ""), action,
+                              sessionId, sourceIpAddr,
+                              ((sessionIsValid) ? "Y" : "N"), request);
         }
 
         /* Certain conditions are immediately resolvable */

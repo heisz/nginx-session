@@ -1,7 +1,7 @@
 /**
  * Shared definitions for the session manager elements.
  *
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2021 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -72,6 +72,10 @@ typedef struct {
 } NGXMGRGlobalDataType;
 
 extern NGXMGRGlobalDataType GlobalData;
+
+/* Convenience method to write to the session log with timestamp */
+void NGXMGR_SessionLog(const char *format, ...)
+                             __attribute__((format(__printf__, 1, 2)));
 
 /*
  * Container element for an instance of a connection from the nginx module.
