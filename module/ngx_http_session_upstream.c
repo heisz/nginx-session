@@ -1,7 +1,7 @@
 /*
  * Custom NGINX upstream implementation for binary manager communication.
  *
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2023 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -375,8 +375,8 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         upstr->headers_in.status_n = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->state->status = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->buffer.pos += 4 + resp_len;
-        req->header_only = 1;
         upstr->keepalive = 1;
+
 
         return NGX_OK;
     }
@@ -401,7 +401,6 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
         upstr->headers_in.status_n = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->state->status = NGX_HTTP_MOVED_TEMPORARILY;
         upstr->buffer.pos += 4 + resp_len;
-        req->header_only = 1;
         upstr->keepalive = 1;
 
         return NGX_OK;
