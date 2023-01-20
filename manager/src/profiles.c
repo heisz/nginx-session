@@ -401,6 +401,8 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         retval->isPassive = FALSE;
         retval->encodedCert = FALSE;
         retval->clockSkew = 0;
+        retval->isExtAuthOnly = FALSE;
+        retval->debugReqResp = FALSE;
 
         retval->attributes = NULL;
         retval->idpCertificate = NULL;
