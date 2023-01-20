@@ -1,7 +1,7 @@
 /**
  * What it's all about, managing session instances!
  * 
- * Copyright (C) 2018-2021 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2023 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -364,9 +364,9 @@ void NGXMGR_AllocateNewSession(int userId, char *sourceIpAddr, time_t expiry,
     if (WXDict_Scan(attributes, encodeAttribute, 
                     &(session->attributes))) goto memfail;
 
-    /* Record it appropriately, if database context is enabled */
+    /* Record it appropriately, if database/user context is enabled */
     /* Just discard persistence in case of error */
-    if (GlobalData.dbConnPool != NULL) {
+    if ((GlobalData.dbConnPool != NULL) && (userId >= 0)) {
         dbconn = WXDBConnectionPool_Obtain(GlobalData.dbConnPool);
         if (dbconn == NULL) {
             WXLog_Error("Failed to obtain connection to record session");

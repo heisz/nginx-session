@@ -1,7 +1,7 @@
 /**
  * Containers for processing the various manager security profiles/config.
  * 
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2023 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -240,6 +240,8 @@ typedef struct {
     int isPassive;
     char *encodedCert;
     int clockSkew;
+    int isExtAuthOnly;
+    int debugReqResp;
 
     /* Derived elements from configuration */
     X509 *idpCertificate;
@@ -292,7 +294,11 @@ static WXJSONBindDefn samlBindings[] = {
     { "clockSkew", WXJSONBIND_INT,
       offsetof(SAMLProfile, clockSkew), FALSE },
     { "attributes", WXJSONBIND_REF,
-      offsetof(SAMLProfile, attributes), FALSE }
+      offsetof(SAMLProfile, attributes), FALSE },
+    { "isExternalAuthOnly", WXJSONBIND_BOOLEAN,
+      offsetof(SAMLProfile, isExtAuthOnly), FALSE },
+    { "debugReqResp", WXJSONBIND_BOOLEAN,
+      offsetof(SAMLProfile, debugReqResp), FALSE }
 };
 
 #define SAML_CFG_COUNT (sizeof(samlBindings) / sizeof(WXJSONBindDefn))
@@ -354,6 +360,16 @@ static int samlAttrScanner(WXHashTable *table, void *key, void *obj,
     }
 
     return 0;
+}
+
+/* Handy for debugging */
+static void logXML(WXMLElement *root) {
+    WXBuffer buffer;
+
+    WXBuffer_Init(&buffer, 1024);
+    WXML_Encode(&buffer, root, TRUE);
+    WXLog_Debug("XML:\n%s", buffer.buffer);
+    WXBuffer_Destroy(&buffer);
 }
 
 /* Standard initialization method for a SAML profile */
@@ -568,6 +584,9 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
 
     /* Authn document is now complete */
 
+    /* Sometimes you just have to look closer */
+    if (profile->debugReqResp) logXML(authnReqElmnt);
+
     /* Following the spec, compact serialize the XML... */
     if (WXML_Encode(&buffer, authnReqElmnt, FALSE) == NULL) goto memfail;
     WXML_Destroy(authnReqElmnt); authnReqElmnt = NULL;
@@ -644,15 +663,6 @@ memfail:
     WXLog_Error("Memory allocation failure!");
     NGXMGR_IssueErrorResponse(conn, 500, "Memory Error",
                        "Internal Error: Manager memory allocation error");
-}
-
-static void logXML(WXMLElement *root) {
-    WXBuffer buffer;
-
-    WXBuffer_Init(&buffer, 1024);
-    WXML_Encode(&buffer, root, TRUE);
-    WXLog_Debug("XML:\n%s", buffer.buffer);
-    WXBuffer_Destroy(&buffer);
 }
 
 /* Standard algorithm for converting civil/Gregorian date to days since epoch */
@@ -858,8 +868,8 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         return;
     }
 
-    /* Enable this to trace SAML XML data exchange */
-    // logXML(root);
+    /* Sometimes you just have to look closer */
+    if (profile->debugReqResp) logXML(root);
 
     /* First, determine the validated references up front (if enabled) */
     if (profile->idpCertificate != NULL) {
@@ -1042,6 +1052,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
 
     /* Final test, one of the Assertions must have validated user identity */
     if (nameId == NULL) {
+        WXLog_Error("Invalid SAML response, no asserted user identity");
         NGXMGR_IssueErrorResponse(conn, 400, "Improper SAML Response",
                                   "One or more signature/validation errors in "
                                   "SAML response, unable to validate user "
@@ -1056,7 +1067,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
 
         /* DB dependent, immediately assign session or validate uid */
         /* TODO - handle externally specified expiry time */
-        if (GlobalData.dbConnPool == NULL) {
+        if ((GlobalData.dbConnPool == NULL) || (profile->isExtAuthOnly)) {
             NGXMGR_AllocateNewSession(-1, sourceIpAddr, -1, &attributes,
                                       (destURL != NULL) ? destURL :
                                                           prf->defaultIndex,
