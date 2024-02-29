@@ -1,7 +1,7 @@
 #
 # Makefile instance for the nginx session management daemon.
 #
-# Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+# Copyright (C) 2018-2024 J.M. Heisz.  All Rights Reserved.
 # See the LICENSE file accompanying the distribution your rights to use
 # this software.
 #
@@ -15,6 +15,7 @@ AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
               -I../toolkit/src/lang \
               -I../toolkit/src/network \
               -I../toolkit/src/utility \
+              @OPENSSL_INCLUDE@ @ZLIB_INCLUDE@ \
               @MYSQL_INCLUDE@ @PGSQL_INCLUDE@ \
               -DSYSCONF_DIR='"$(sysconfdir)"'
 
@@ -43,7 +44,7 @@ if INCLUDE_PGSQL_DRV
 ngxsessmgr_SOURCES += ../toolkit/src/db/pgsql/dbfpgsql.c
 endif
 
-ngxsessmgr_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ -lz -lcrypto -lpthread -lm
+ngxsessmgr_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ @ZLIB_LIB@ @OPENSSL_LIB@ -lpthread -lm
 
 # Clone the example configuration file
 ngxsessmgr_confdir = $(sysconfdir)

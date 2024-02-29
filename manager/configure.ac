@@ -1,7 +1,7 @@
 #
 # Autoconf macro definitions for the session manager server.
 #
-# Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+# Copyright (C) 2018-2024 J.M. Heisz.  All Rights Reserved.
 # See the LICENSE file accompanying the distribution your rights to use
 # this software.
 #
@@ -55,6 +55,34 @@ AC_ARG_WITH(label,
 ])
 
 ####### Part D - Dependent Product/Library Determination #######
+
+# Link to static OpenSSL Nginx build
+AC_ARG_WITH(openssl,
+[  --with-openssl           Indicate root of local/static OpenSSL build directory ],
+[
+    OPENSSL_INCLUDE="-I${withval}/include"
+    AC_SUBST(OPENSSL_INCLUDE)
+    OPENSSL_LIB="${withval}/libcrypto.a"
+    AC_SUBST(OPENSSL_LIB)
+],
+[
+    OPENSSL_LIB="-lcrypto"
+    AC_SUBST(OPENSSL_LIB)
+])
+
+# Link to static zlib Nginx build
+AC_ARG_WITH(zlib,
+[  --with-zlib           Indicate root of local/static zlib build directory ],
+[
+    ZLIB_INCLUDE="-I${withval}"
+    AC_SUBST(ZLIB_INCLUDE)
+    ZLIB_LIB="${withval}/libz.a"
+    AC_SUBST(ZLIB_LIB)
+],
+[
+    ZLIB_LIB="-lz"
+    AC_SUBST(ZLIB_LIB)
+])
 
 # Determine if MySQL is available and provide associated definitions
 AC_CHECK_PROGS(MYSQL_CONFIG, mysql_config)
