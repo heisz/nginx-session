@@ -1,7 +1,7 @@
 /*
  * Primary module engine entry point for the NGINX session management module.
  *
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2024 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -433,12 +433,12 @@ static void ngx_http_session_parse_form_param(ngx_http_request_t *req,
                                              &access_token_str,
                                              &(fctx->session_id))) return;
         }
-	if (slcf->oauth_mode != 0) {
+        if (slcf->oauth_mode != 0) {
             fctx->id_src = "oauthv1 form parameter";
             if (ngx_http_session_extract_val(req, pos, eq, last,
                                              &oauth_token_str,
                                              &(fctx->session_id))) return;
-	}
+        }
     }
 }
 
@@ -685,9 +685,9 @@ static char *ngx_http_session_cookie_flags(ngx_conf_t *cf, ngx_command_t *cmd,
                    (ngx_strncasecmp(values[idx].data,
                                     (u_char *) "secure", 6) == 0)) {
             flags |= NGX_HTTP_SESSION_COOKIE_SECURE;
-	} else if ((values[idx].len >= 8) &&
-		   (ngx_strncasecmp(values[idx].data,
-				    (u_char *) "samesite", 8) == 0)) {
+        } else if ((values[idx].len >= 8) &&
+                   (ngx_strncasecmp(values[idx].data,
+                                    (u_char *) "samesite", 8) == 0)) {
             flags &= ~NGX_HTTP_SESSION_COOKIE_SAMESITE_MASK;
             if (values[idx].len == 8) {
                 flags |= NGX_HTTP_SESSION_COOKIE_SAMESITE_NONE;
@@ -906,10 +906,12 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     /* Based on configuration, determine the inbound session identifier */
     /* Of course, this presumes that the parameter wasn't pulled from post */
     if ((session_id.len == 0) && (slcf->cookie_name.len != 0)) {
-        /* Actually don't really care about the index, just the value */
-        la = ngx_http_parse_multi_header_lines(&(req->headers_in.cookies),
-                                               &(slcf->cookie_name),
-                                               &session_id);
+        if (ngx_http_parse_multi_header_lines(req, req->headers_in.cookie,
+                                              &(slcf->cookie_name),
+                                              &session_id) == NULL) {
+            /* Ensure any processing didn't leave an artifact */
+            session_id.len = 0;
+        }
         id_src = "cookie";
     }
     if ((session_id.len == 0) && (slcf->parameter_name.len != 0)) {

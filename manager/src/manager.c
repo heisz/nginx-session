@@ -331,7 +331,7 @@ int main(int argc, char **argv) {
     if (daemonMode) {
         daemonStart(rootDir, "SMGR",
                     ((GlobalData.pidFileName != NULL) ?
-                        GlobalData.pidFileName : "/var/run/sessmgr.pid"),
+                        GlobalData.pidFileName : "/run/sessmgr.pid"),
                     ((GlobalData.managerLogFileName != NULL) ?
                         GlobalData.managerLogFileName : "/var/log/sessmgr.log"),
                     coreSignalHandler);
