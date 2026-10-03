@@ -966,7 +966,7 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
                               3 + (lb = slcf->profile_name.len) +
                               3 + (lc = session_id.len) +
                               3 + (ld = req->connection->addr_text.len) +
-                              7 + (le = req->uri.len);
+                              7 + (le = req->unparsed_uri.len);
     if (slcf->sess_req != NGXMGR_SESSION_ACTION) ctx->request_length -= 3;
 
     /* Element lengths are 16-bit in the protocol, don't silently truncate */
@@ -1001,7 +1001,7 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
     *((uint16_t *) ptr) = htons((le + 4)); ptr += 2;
     ngx_memcpy(ptr, get_method_name(req->method), 3); ptr += 3;
     *(ptr++) = ' ';
-    ngx_memcpy(ptr, req->uri.data, le); ptr += le;
+    ngx_memcpy(ptr, req->unparsed_uri.data, le); ptr += le;
     *(ptr++) = '\0';
 
     /* Attach to the request context */

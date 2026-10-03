@@ -259,13 +259,14 @@ static void processRequest(NGXModuleConnection *conn) {
                                             profile->sessionIPLocked,
                                             &sessionAttrs);
 
-    /* Generate session log entry if enabled */
+    /* Generate session log entry if enabled (discarding query args/tokens) */
     if (GlobalData.sessionLogFile != NULL) {
-        NGXMGR_SessionLog("%s%s%s[%s:%s->%s] %s", profile->name,
+        NGXMGR_SessionLog("%s%s%s[%s:%s->%s] %.*s", profile->name,
                           ((action != NULL) ? ":" : ""),
                           ((action != NULL) ? action : ""),
                           sessionId, sourceIpAddr,
-                          ((sessionIsValid) ? "Y" : "N"), request);
+                          ((sessionIsValid) ? "Y" : "N"),
+                          (int) strcspn(request, "?"), request);
     }
 
     /* Certain conditions are immediately resolvable */
