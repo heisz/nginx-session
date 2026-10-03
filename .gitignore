@@ -9,6 +9,7 @@ manager/stamp-h1
 Makefile.in
 Makefile
 .deps
+.libs
 
 # Intermediates from C-based compilation
 *.o
@@ -21,3 +22,6 @@ Makefile
 
 # Editing
 *.swp
+
+# Build outputs
+manager/src/ngxsessmgr

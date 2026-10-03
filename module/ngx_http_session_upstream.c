@@ -1,7 +1,7 @@
 /*
  * Custom NGINX upstream implementation for binary manager communication.
  *
- * Copyright (C) 2018-2023 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2026 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -29,27 +29,38 @@ static ngx_int_t ngx_http_session_create_request(ngx_http_request_t *req) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: creating upstream request");
 
-    /* Verify body content availability (memory) and compute net length */
-    /* Not clear if content_length_n is updated by NGINX, follow examples... */
-    if (req->request_body->temp_file != NULL) {
-        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
-                      "Session POST actions must fit into memory buffer, "
-                      "adjust client_body_buffer_size > [%d bytes]",
-                      (int) req->headers_in.content_length_n);
-        return NGX_HTTP_INSUFFICIENT_STORAGE;
-    }
-    lnk = req->request_body->bufs;
-    while (lnk != NULL) {
-        blen += ngx_buf_size(lnk->buf);
-        lnk = lnk->next;
+    /* Need the original request context for the send data */
+    ctx = ngx_http_get_module_ctx(req, ngx_http_session_module);
+    cmd = *(ctx->request_content);
+
+    /* Only actions consume the body, others leave it for the redirect */
+    if ((cmd == NGXMGR_SESSION_ACTION) && (req->request_body != NULL)) {
+        /* Verify body content availability (memory) and compute net length */
+        /* Not clear if content_length_n is updated by NGINX, follow examples */
+        if (req->request_body->temp_file != NULL) {
+            ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
+                          "Session POST actions must fit into memory buffer, "
+                          "adjust client_body_buffer_size > [%d bytes]",
+                          (int) req->headers_in.content_length_n);
+            return NGX_HTTP_INSUFFICIENT_STORAGE;
+        }
+
+        lnk = req->request_body->bufs;
+        while (lnk != NULL) {
+            blen += ngx_buf_size(lnk->buf);
+            lnk = lnk->next;
+        }
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
                    "*** session manager: request data %d bytes", (int) blen);
 
-    /* Need the original request context for the send data */
-    ctx = ngx_http_get_module_ctx(req, ngx_http_session_module);
-    cmd = *(ctx->request_content);
+    /* Check for protocol overflow (24 bit length) */
+    if ((ctx->request_length - 4 + blen) > 0x00FFFFFF) {
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
+                      "Session request too large for manager protocol");
+        return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+    }
 
     /* Create a buffer instance and populate it with the original request */
     buff = ngx_create_temp_buf(req->pool, ctx->request_length + blen);
@@ -267,7 +278,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
 
     if (code == NGXMGR_SESSION_CONTINUE) {
         /* Full response is required for variable handling */
-        if (buff_len < resp_len) return NGX_AGAIN;
+        if (buff_len < resp_len + 4) return NGX_AGAIN;
 
         /* Verify variable set, assign to context */
         cnt = ngx_http_session_validate_strlist(upstr->buffer.pos + 4,
@@ -311,7 +322,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
 
     if (code == NGXMGR_SESSION_ESTABLISH) {
         /* Full response is required for redirect and variable setting */
-        if (buff_len < resp_len) return NGX_AGAIN;
+        if (buff_len < resp_len + 4) return NGX_AGAIN;
 
         /* Verify variable set, assign to context */
         cnt = ngx_http_session_validate_strlist(upstr->buffer.pos + 4,
@@ -383,7 +394,7 @@ static ngx_int_t ngx_http_session_process_header(ngx_http_request_t *req) {
 
     if (code == NGXMGR_EXTERNAL_REDIRECT) {
         /* Full response is required for redirect URL */
-        if (buff_len < resp_len) return NGX_AGAIN;
+        if (buff_len < resp_len + 4) return NGX_AGAIN;
 
         /* Push it to the location header */
         req->headers_out.location = ngx_list_push(&(req->headers_out.headers));

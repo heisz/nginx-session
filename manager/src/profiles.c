@@ -1,7 +1,7 @@
 /**
  * Containers for processing the various manager security profiles/config.
  * 
- * Copyright (C) 2018-2023 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2026 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -19,6 +19,7 @@
 #include "encoding.h"
 #include "log.h"
 #include "mem.h"
+#include "thread.h"
 
 /* Not sure why this isn't generally exposed */
 #ifndef DEF_MEM_LEVEL
@@ -248,8 +249,9 @@ typedef struct {
     WXJSONValue *attributes;
     WXDictionary attrMap;
 
-    /* Other profile-specific data (all accessed in event thread) */
+    /* Pending request tracking, shared across fibers (watch lock/yield) */
     WXHashTable reqSessions;
+    WXThread_Mutex reqLock;
 } SAMLProfile;
 
 /**
@@ -412,6 +414,11 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
             WXFree(retval);
             return NULL;
         }
+        if (WXThread_MutexInit(&(retval->reqLock), FALSE) != WXTRC_OK) {
+            WXLog_Error("Failed to initialize SAML request tracking lock");
+            WXFree(retval);
+            return NULL;
+        }
     } else {
         /* Update base configuration */
         StdProfileInit(orig, NULL, NULL, config);
@@ -514,10 +521,13 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     } else {
         /* Fall back to the conifigured default index */
     }
+    (void) WXThread_MutexLock(&(profile->reqLock));
     if (!WXHash_PutEntry(&(profile->reqSessions), sessReqId, reqSession,
                          NULL, NULL, WXHash_StrHashFn, WXHash_StrEqualsFn)) {
+        (void) WXThread_MutexUnlock(&(profile->reqLock));
         goto memfail;
     }
+    (void) WXThread_MutexUnlock(&(profile->reqLock));
 
     /* Build the authentication request document based on details and config */
     authNs.prefix = "samlp";
@@ -655,9 +665,11 @@ memfail:
     if (deflateBuff != NULL) WXFree(deflateBuff);
     WXBuffer_Destroy(&buffer);
     if (reqSession != NULL) {
+        (void) WXThread_MutexLock(&(profile->reqLock));
         (void) WXHash_RemoveEntry(&(profile->reqSessions),
                                   reqSession->reqSessionId, NULL, NULL,
                                   WXHash_StrHashFn, WXHash_StrEqualsFn);
+        (void) WXThread_MutexUnlock(&(profile->reqLock));
         if (reqSession->destURL != NULL) WXFree(reqSession->destURL);
         WXFree(reqSession->reqSessionId);
         WXFree(reqSession);
@@ -722,8 +734,7 @@ int extAttrFieldCB(WXHashTable *table, void *key, void *obj, void *userData) {
     return 0;
 }
 
-static void *samlLoginFinish(void *arg) {
-    SAMLLoginInfo *info = (SAMLLoginInfo *) arg;
+static void samlLoginFinish(SAMLLoginInfo *info) {
     WXBuffer *cmdbuff = &(info->cmdbuff);
     WXDBConnection *dbconn = NULL;
     WXDBResultSet *rs = NULL;
@@ -751,7 +762,7 @@ static void *samlLoginFinish(void *arg) {
     if (WXBuffer_Append(cmdbuff, "'\0", 2, TRUE) == NULL) goto memfail;
 
     /* Issue query and validate/extract user information */
-    dbconn = WXDBConnectionPool_Obtain(GlobalData.dbConnPool);
+    dbconn = NGXMGR_ObtainDBConnection();
     if (dbconn == NULL) {
         WXLog_Error("Failed to obtain connection for user verification");
         goto verifyfail;
@@ -785,6 +796,12 @@ static void *samlLoginFinish(void *arg) {
         }
     }
 
+    /* Release before allocating, which needs a (capped) connection too */
+    WXDBResultSet_Close(rs);
+    rs = NULL;
+    NGXMGR_ReturnDBConnection(dbconn);
+    dbconn = NULL;
+
     /* And issue the session instance */
     NGXMGR_AllocateNewSession(userId, info->sourceIpAddr, -1,
                               &(info->attributes),
@@ -794,13 +811,13 @@ static void *samlLoginFinish(void *arg) {
 
 cleanup:
     if (rs != NULL) WXDBResultSet_Close(rs);
-    if (dbconn != NULL) WXDBConnectionPool_Return(dbconn);
+    if (dbconn != NULL) NGXMGR_ReturnDBConnection(dbconn);
     WXArray_Destroy(&(info->extAttrKeys));
     WXBuffer_Destroy(&(info->cmdbuff));
     if (info->destURL != NULL) WXFree(info->destURL);
     WXDict_Destroy(&(info->attributes));
     WXFree(info);
-    return NULL;
+    return;
 
 memfail:
     WXLog_Error("Memory allocation failure in SAML login completion");
@@ -984,15 +1001,20 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             WXLog_Warn("Assertion Subject missing InResponseTo, skipping");
             conf = NULL;
         } else {
+            (void) WXThread_MutexLock(&(profile->reqLock));
             reqSession = WXHash_GetEntry(&(profile->reqSessions), attr->value,
                                          WXHash_StrHashFn, WXHash_StrEqualsFn);
+            if (reqSession != NULL) {
+                (void) WXHash_RemoveEntry(&(profile->reqSessions), attr->value,
+                                          NULL, NULL, WXHash_StrHashFn,
+                                          WXHash_StrEqualsFn);
+            }
+            (void) WXThread_MutexUnlock(&(profile->reqLock));
+
             if (reqSession == NULL) {
                 WXLog_Warn("Unsolicited or replay Assertion, skipping");
                 conf = NULL;
             } else {
-                (void) WXHash_RemoveEntry(&(profile->reqSessions), attr->value,
-                                          NULL, NULL, WXHash_StrHashFn,
-                                          WXHash_StrEqualsFn);
                 /* Steal the destination for use in the redirect */
                 destURL = reqSession->destURL;  reqSession->destURL = NULL;
                 WXFree(reqSession->reqSessionId);
@@ -1075,7 +1097,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                                                           prf->defaultIndex,
                                       conn, StdSessionEstablishHandler);
         } else {
-            /* Hand off to the worker process for database interaction */
+            /* Could fold together but keep alignment with old event model */
             info = (SAMLLoginInfo *) WXCalloc(sizeof(SAMLLoginInfo));
             if (info == NULL) goto memfail;
             info->prf = prf;
@@ -1084,15 +1106,11 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
             info->destURL = destURL;
             info->attributes = attributes;
 
-            if (WXThreadPool_Enqueue(GlobalData.workerThreadPool,
-                                     samlLoginFinish, info) < 0) {
-                WXLog_Error("Failed to issue worker for login completion");
-                WXFree(info);
-            } else {
-                /* Nullify to prevent cleanup mucking up handoff */
-                destURL = NULL;
-                (void) memset(&attributes, 0, sizeof(WXDictionary));
-            }
+            /* Nullify to prevent cleanup mucking up handoff */
+            destURL = NULL;
+            (void) memset(&attributes, 0, sizeof(WXDictionary));
+
+            samlLoginFinish(info);
         }
     }
 

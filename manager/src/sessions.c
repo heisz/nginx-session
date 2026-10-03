@@ -1,17 +1,21 @@
 /**
  * What it's all about, managing session instances!
  * 
- * Copyright (C) 2018-2023 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2026 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
 #include "stdconfig.h"
+#include <errno.h>
 #include <openssl/rand.h>
 #include "manager.h"
 #include "hash.h"
 #include "thread.h"
 #include "log.h"
 #include "mem.h"
+
+/* Lock to prevent write during session logging reconfigure */
+static WXThread_Mutex sessionLogLock = WXTHREAD_MUTEX_STATIC_INIT;
 
 /* Shared method for logging messages to the session log */
 #define SESSION_LOG_LIMIT 4096
@@ -20,19 +24,43 @@ void NGXMGR_SessionLog(const char *format, ...) {
     va_list ap;
     int len;
 
-    if (GlobalData.sessionLogFile != NULL) {
-        WXLog_GetFormattedTimestamp(message);
-        len = strlen(message);
-        message[len++] = ' ';
-        va_start(ap, format);
-        len += vsnprintf(message + len, SESSION_LOG_LIMIT - len, format, ap);
-        va_end(ap);
-        if (len > SESSION_LOG_LIMIT - 3) len = SESSION_LOG_LIMIT - 3;
-        (void) strcpy(message + len, "\n");
+    /* Quick check to avoid lock/format if logging inactive */
+    if (GlobalData.sessionLogFile == NULL) return;
 
+    /* Format outside of the lock (minimize critical processing) */
+    WXLog_GetFormattedTimestamp(message);
+    len = strlen(message);
+    message[len++] = ' ';
+    va_start(ap, format);
+    len += vsnprintf(message + len, SESSION_LOG_LIMIT - len, format, ap);
+    va_end(ap);
+    if (len > SESSION_LOG_LIMIT - 3) len = SESSION_LOG_LIMIT - 3;
+    (void) strcpy(message + len, "\n");
+
+    /* Write under lock with recheck in case of reconfigure */
+    (void) WXThread_MutexLock(&sessionLogLock);
+    if (GlobalData.sessionLogFile != NULL) {
         (void) fprintf(GlobalData.sessionLogFile, "%s", message);
         (void) fflush(GlobalData.sessionLogFile);
     }
+    (void) WXThread_MutexUnlock(&sessionLogLock);
+}
+
+/* (Re)open the session log according to configuration */
+void NGXMGR_ReopenSessionLog() {
+    (void) WXThread_MutexLock(&sessionLogLock);
+    if (GlobalData.sessionLogFile != NULL) {
+        (void) fclose(GlobalData.sessionLogFile);
+        GlobalData.sessionLogFile = NULL;
+    }
+    if (GlobalData.sessionLogFileName != NULL) {
+        GlobalData.sessionLogFile =
+                         fopen(GlobalData.sessionLogFileName, "a+");
+        if (GlobalData.sessionLogFile == NULL) {
+            WXLog_Error("Unable to open logging file: %s", strerror(errno));
+        }
+    }
+    (void) WXThread_MutexUnlock(&sessionLogLock);
 }
 
 /* Tracking structure for active session instances */
@@ -80,7 +108,7 @@ void NGXMGR_InitializeSessions() {
     }
 
     /* On restart, prune the session database and reload (empty on failure) */
-    dbconn = WXDBConnectionPool_Obtain(GlobalData.dbConnPool);
+    dbconn = NGXMGR_ObtainDBConnection();
     if (dbconn == NULL) {
         WXLog_Error("Failed to obtain connection to reinit session list");
         sessionsInitialized = TRUE;
@@ -164,7 +192,7 @@ void NGXMGR_InitializeSessions() {
     }
 
     /* Always put your toys away */
-    WXDBConnectionPool_Return(dbconn);
+    NGXMGR_ReturnDBConnection(dbconn);
 }
 
 /* Looks like base-64 but it's not */
@@ -194,10 +222,10 @@ char *NGXMGR_GenerateSessionId(int idlen) {
     retval = (uint8_t *) WXMalloc(idlen + 5);
     if (retval == NULL) return NULL;
     if (RAND_bytes(retval, dlen) != 1) {
-        /* Psuedo-random it is */
-        for (idx = 0; idx < dlen; idx++) {
-            retval[idx] = random() & 0xFF;
-        }
+        /* Enforce secure random only */
+        WXLog_Error("Unable to obtain secure random data for session id");
+        WXFree(retval);
+        return NULL;
     }
     ptr = retval + dlen - 1;
     str = retval + 4 * (dlen / 3) - 1;
@@ -217,14 +245,14 @@ char *NGXMGR_GenerateSessionId(int idlen) {
     return retval;
 }
 
-/* Worker thread method to flush underlying database record */
-static void *flushSessionRecord(void *arg) {
+/* Fiber method to flush underlying database record */
+static void flushSessionRecord(void *arg) {
     NGXMGRSession *session = (NGXMGRSession *) arg;
     WXDBConnection *dbconn;
     char cmdbuff[1024];
 
     /* Delete the associated session record */
-    dbconn = WXDBConnectionPool_Obtain(GlobalData.dbConnPool);
+    dbconn = NGXMGR_ObtainDBConnection();
     if (dbconn == NULL) {
         WXLog_Error("Failed to obtain connection to flush session");
     } else {
@@ -236,13 +264,13 @@ static void *flushSessionRecord(void *arg) {
                         WXDB_GetLastErrorMessage(dbconn));
         }
 
-        WXDBConnectionPool_Return(dbconn);
+        NGXMGR_ReturnDBConnection(dbconn);
     }
 
     /* Regardless of database outcome, clean up memory record */
     _destroySession(session);
 
-    return NULL;
+    return;
 }
 
 /* Validate the indicated session, taking lifespan and source IP into account */
@@ -307,9 +335,8 @@ int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
             _destroySession(session);
         } else {
             /* Asynchronously discard the database session record */
-            if (WXThreadPool_Enqueue(GlobalData.workerThreadPool,
-                                     flushSessionRecord, session) < 0) {
-                WXLog_Error("Failed to issue worker for session flush");
+            if (GMPS_Start(flushSessionRecord, session) == NULL) {
+                WXLog_Error("Failed to issue fiber for session flush");
                 _destroySession(session);
             }
         }
@@ -329,7 +356,7 @@ static int encodeAttribute(WXDictionary *dict, const char *key,
 }
 
 /* Allocate a session instance, based on external authentication actions */
-/* Note: this method must be in a worker if database access is enabled */
+/* Note: this method must be on a fiber if database access is enabled */
 void NGXMGR_AllocateNewSession(int userId, char *sourceIpAddr, time_t expiry,
                                WXDictionary *attributes, char *destURL,
                                NGXModuleConnection *conn,
@@ -367,14 +394,14 @@ void NGXMGR_AllocateNewSession(int userId, char *sourceIpAddr, time_t expiry,
     /* Record it appropriately, if database/user context is enabled */
     /* Just discard persistence in case of error */
     if ((GlobalData.dbConnPool != NULL) && (userId >= 0)) {
-        dbconn = WXDBConnectionPool_Obtain(GlobalData.dbConnPool);
+        dbconn = NGXMGR_ObtainDBConnection();
         if (dbconn == NULL) {
             WXLog_Error("Failed to obtain connection to record session");
         } else {
             cmdbuff = (char *) WXMalloc(session->attributes.length * 2 +
                                         GlobalData.sessionIdLen + 256);
             if (cmdbuff == NULL) {
-                WXDBConnectionPool_Return(dbconn);
+                NGXMGR_ReturnDBConnection(dbconn);
                 goto memfail;
             }
 
@@ -410,7 +437,7 @@ void NGXMGR_AllocateNewSession(int userId, char *sourceIpAddr, time_t expiry,
             }
 
             WXFree(cmdbuff);
-            WXDBConnectionPool_Return(dbconn);
+            NGXMGR_ReturnDBConnection(dbconn);
         }
     }
 

@@ -20,6 +20,7 @@ AM_CONFIG_HEADER(config.h)
 # Uses libtool notation for sub-library compilation
 AM_PROG_AR
 LT_INIT
+AM_PROG_AS
 
 # Configure the automake system and target host instance
 AM_INIT_AUTOMAKE([-Wall foreign subdir-objects])
@@ -53,6 +54,21 @@ AC_ARG_WITH(label,
     AC_DEFINE_UNQUOTED([BUILDLABEL], [""],
                        [Empty placeholder for label associated with the build])
 ])
+
+# Handle architecture specific compilation for assembly elements
+case "$host_cpu" in
+     x86_64* | amd64*)
+        AM_CONDITIONAL([ARCH_XA64], [true])
+        AM_CONDITIONAL([ARCH_ARM64], [false])
+        ;;
+    aarch64* | arm64*)
+        AM_CONDITIONAL([ARCH_XA64], [false])
+        AM_CONDITIONAL([ARCH_ARM64], [true])
+        ;;
+    *)
+        AC_MSG_ERROR([Unsupported architecture: $host_cpu])
+        ;;
+esac
 
 ####### Part D - Dependent Product/Library Determination #######
 
@@ -129,6 +145,7 @@ AC_CHECK_HEADERS([sys/endian.h])
 AC_CHECK_HEADERS([byteswap.h])
 AC_CHECK_HEADERS([poll.h])
 AC_CHECK_HEADERS([sys/epoll.h])
+AC_CHECK_HEADERS([sys/signalfd.h])
 
 ####### All Done - Generate Configuration Specific Files #######
 

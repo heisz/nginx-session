@@ -1,7 +1,7 @@
 #
 # Makefile instance for the nginx session management daemon.
 #
-# Copyright (C) 2018-2024 J.M. Heisz.  All Rights Reserved.
+# Copyright (C) 2018-2026 J.M. Heisz.  All Rights Reserved.
 # See the LICENSE file accompanying the distribution your rights to use
 # this software.
 #
@@ -14,6 +14,7 @@ AM_CPPFLAGS = -I.. -I../.. -I../toolkit \
               -I../toolkit/src/db \
               -I../toolkit/src/lang \
               -I../toolkit/src/network \
+              -I../toolkit/src/scheduler \
               -I../toolkit/src/utility \
               @OPENSSL_INCLUDE@ @ZLIB_INCLUDE@ \
               @MYSQL_INCLUDE@ @PGSQL_INCLUDE@ \
@@ -24,13 +25,12 @@ ngxsessmgr_SOURCES = manager.c requests.c profiles.c xmlsig.c sessions.c \
                   ../toolkit/src/lang/encoding.c \
                   ../toolkit/src/lang/json.c \
                   ../toolkit/src/lang/xml.c \
-                  ../toolkit/src/network/event.c \
                   ../toolkit/src/network/socket.c \
+                  ../toolkit/src/scheduler/scheduler.c \
                   ../toolkit/src/utility/array.c \
                   ../toolkit/src/utility/buffer.c \
                   ../toolkit/src/utility/daemon.c \
                   ../toolkit/src/utility/hash.c \
-                  ../toolkit/src/utility/threadpool.c \
                   ../toolkit/src/utility/thread.c \
                   ../toolkit/src/utility/log.c \
                   ../toolkit/src/utility/mem.c
@@ -42,6 +42,13 @@ endif
 
 if INCLUDE_PGSQL_DRV
 ngxsessmgr_SOURCES += ../toolkit/src/db/pgsql/dbfpgsql.c
+endif
+
+if ARCH_XA64
+ngxsessmgr_SOURCES += ../toolkit/src/scheduler/gmpctx_xa64.S
+endif
+if ARCH_ARM64
+ngxsessmgr_SOURCES += ../toolkit/src/scheduler/gmpctx_arm64.S
 endif
 
 ngxsessmgr_LDADD = @MYSQL_LIB@ @PGSQL_LIB@ @ZLIB_LIB@ @OPENSSL_LIB@ -lpthread -lm

@@ -1,7 +1,7 @@
 /*
  * Primary module engine entry point for the NGINX session management module.
  *
- * Copyright (C) 2018-2024 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2026 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -814,7 +814,7 @@ static void ngx_http_session_find_param(ngx_http_request_t *req,
 
         eq = ngx_strlchr(ptr, amp, '=');
         if (eq != NULL) {
-            if (ngx_http_session_extract_val(req, ptr, eq, last,
+            if (ngx_http_session_extract_val(req, ptr, eq, amp,
                                              name, val)) return;
         }
 
@@ -968,6 +968,15 @@ static ngx_int_t ngx_http_session_request_handler(ngx_http_request_t *req) {
                               3 + (ld = req->connection->addr_text.len) +
                               7 + (le = req->uri.len);
     if (slcf->sess_req != NGXMGR_SESSION_ACTION) ctx->request_length -= 3;
+
+    /* Element lengths are 16-bit in the protocol, don't silently truncate */
+    if ((la > 0xFFFF) || (lb > 0xFFFF) || (lc > 0xFFFF) || (ld > 0xFFFF) ||
+            ((le + 4) > 0xFFFF)) {
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0,
+                      "*** session manager: request element too long");
+        return NGX_HTTP_REQUEST_URI_TOO_LARGE;
+    }
+
     ctx->request_content = ngx_pcalloc(req->pool, ctx->request_length + 1);
     if ((ptr = ctx->request_content) == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;

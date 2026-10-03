@@ -1,7 +1,7 @@
 /**
  * Core elements for XML signature/reference (V1.1) verification.
  * 
- * Copyright (C) 2018-2020 J.M. Heisz.  All Rights Reserved.
+ * Copyright (C) 2018-2026 J.M. Heisz.  All Rights Reserved.
  * See the LICENSE file accompanying the distribution your rights to use
  * this software.
  */
@@ -18,9 +18,9 @@
 /* Wrapper for logging OpenSSL errors */
 static int openSSLErrCB(const char *str, size_t len, void *u) {
     uint32_t lvlLine = (uint32_t) (intptr_t) u;
-fprintf(stderr, "CB\n");
     _WXLog_Print(__FILE__, lvlLine & 0x00FFFFFF, ((lvlLine >> 24) & 0xFF),
                  "%*s", (int) len, str);
+    return 1;
 }
 #define WXLog_OpenSSLErr(level) \
     ERR_print_errors_cb(openSSLErrCB, \
@@ -77,7 +77,7 @@ static void validateReference(WXMLLinkedElement **signedRefs,
     }
 
     /* And URI target must be an internal object reference */
-    if ((*(attr->value) != '#') ||
+    if ((attr->value == NULL) || (*(attr->value) != '#') ||
             ((target = WXHash_GetEntry(idMap, attr->value + 1,
                                        WXHash_StrHashFn,
                                        WXHash_StrEqualsFn)) == NULL)) {
@@ -108,7 +108,7 @@ static void validateReference(WXMLLinkedElement **signedRefs,
 
     /* Pull the digest value before churning the digest structures */
     digValue = WXML_Find(refElmnt, "DigestValue", FALSE);
-    if (digValue == NULL) {
+    if ((digValue == NULL) || (digValue->content == NULL)) {
         WXLog_Warn("Missing DigestValue in Reference content");
         WXBuffer_Destroy(&encBuffer);
         return;
@@ -123,6 +123,10 @@ static void validateReference(WXMLLinkedElement **signedRefs,
     BIO_set_flags(base64Buff, BIO_FLAGS_BASE64_NO_NL);
     diglen = BIO_read(base64Buff, digest, diglen);
     BIO_free_all(base64Buff); base64Buff = NULL;
+    if (diglen <= 0) {
+        WXLog_Warn("Invalid base64 encoding of DigestValue");
+        goto errclean;
+    }
 
     /* Determine/initialize the digest method */
     attr = WXML_Find(refElmnt, "DigestMethod/@Algorithm", FALSE);
@@ -292,7 +296,8 @@ static int validateSignature(WXMLElement *sigElmnt, EVP_PKEY *key) {
 
     /* Likewise, find and decode (base 64) the signature value */
     sigValue = getNextElement(signedInfo);
-    if ((sigValue == NULL) || (strcmp(sigValue->name, "SignatureValue") != 0)) {
+    if ((sigValue == NULL) || (strcmp(sigValue->name, "SignatureValue") != 0) ||
+            (sigValue->content == NULL)) {
         WXLog_Warn("Found <Signature> but missing <SignatureValue> in content");
         WXBuffer_Destroy(&encBuffer);
         return FALSE;
@@ -307,6 +312,10 @@ static int validateSignature(WXMLElement *sigElmnt, EVP_PKEY *key) {
     BIO_set_flags(base64Buff, BIO_FLAGS_BASE64_NO_NL);
     siglen = BIO_read(base64Buff, signature, siglen);
     BIO_free_all(base64Buff); base64Buff = NULL;
+    if (siglen <= 0) {
+        WXLog_Warn("Invalid base64 encoding of SignatureValue");
+        goto errclean;
+    }
 
     /* Determine the appropriate model for signing */
     attr = (WXMLAttribute *) WXML_Find(signedInfo, "SignatureMethod/@Algorithm",
@@ -324,15 +333,6 @@ static int validateSignature(WXMLElement *sigElmnt, EVP_PKEY *key) {
     if (strcmp(attr->value,
                "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256") == 0) {
         if ((rc = EVP_DigestVerifyInit(mdctx, NULL, EVP_sha256(),
-                                       NULL, key)) != 1) {
-            WXLog_Error("Error in EVP_DigestVerifyInit(): %d/%d",
-                        rc, (int) ERR_get_error());
-            WXLog_OpenSSLErr(WXLOG_ERROR);
-            goto errclean;
-        }
-    } else if (strcmp(attr->value,
-                      "http://www.w3.org/2001/04/xmldsig#rsa-sha1") == 0) {
-        if ((rc = EVP_DigestVerifyInit(mdctx, NULL, EVP_sha1(),
                                        NULL, key)) != 1) {
             WXLog_Error("Error in EVP_DigestVerifyInit(): %d/%d",
                         rc, (int) ERR_get_error());

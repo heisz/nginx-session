@@ -8,9 +8,9 @@ After=network.target
 
 [Service]
 Type=forking
-PIDFile=/var/run/sessmgr.pid
+PIDFile=/run/sessmgr.pid
 ExecStart=ngxsessmgr -r /var
-ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/5 --pidfile /var/run/t1labs-nginx.pid
+ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry TERM/5 --pidfile /run/sessmgr.pid
 TimeoutStopSec=5
 KillMode=mixed
 

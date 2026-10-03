@@ -9,8 +9,7 @@
 #define NGXSESS_MANAGER_H 1
 
 #include "socket.h"
-#include "event.h"
-#include "threadpool.h"
+#include "scheduler.h"
 #include "dbxf.h"
 #include "json.h"
 #include "buffer.h"
@@ -21,25 +20,24 @@
 
 /* Storage type and global reference to process configuration settings */
 typedef struct {
-    /* Interface/address to listen for module requests on (default: any) */
+    /* Interface/address to listen for requests on (default: 127.0.0.1) */
     char *svcBindAddr;
 
     /* Bind port/service for client connections/requests (default: 5344) */
     char *svcBindService;
 
-    /* Initial number of server connections in the event pool (default: 1024) */
-    size_t initialEventPoolSize;
+    /* Maximum accepted request size from the module (default: 1MB) */
+    size_t maxRequestSize;
 
-    /* Event loop connection polling size (default: 1024) */
-    size_t eventPollLimit;
-
-    /* Limits on the worker thread pool for asynchronous event processing 2/8 */
-    size_t minThreadPoolWorkers;
-    size_t maxThreadPoolWorkers;
+    /* Fiber scheduler processor count, zero to default to the CPU count */
+    size_t schedulerProcessors;
 
     /* Access/authentication information for database management */
     char *dataSourceName;
     char *dbUser, *dbPasswd;
+
+    /* Limit on concurrent (fiber) database connections (default: 8) */
+    size_t dbMaxConnections;
 
     /* Configuration-driven logging filenames */
     char *pidFileName;
@@ -55,9 +53,6 @@ typedef struct {
     /* ---- */
     /* Things below here are not directly bound from configuration */
 
-    /* Worker threading pool for handling asynchronous requests */
-    WXThreadPool *workerThreadPool;
-
     /* Database connection pool, NULL if no database access is enabled */
     WXDBConnectionPool *dbConnPool;
 
@@ -66,9 +61,6 @@ typedef struct {
 
     /* Storage element for the profile hash */
     WXHashTable *profiles;
-
-    /* Just being sneaky, this flag is only controlled by the signaller */
-    int shutdownRequested;
 } NGXMGRGlobalDataType;
 
 extern NGXMGRGlobalDataType GlobalData;
@@ -77,6 +69,13 @@ extern NGXMGRGlobalDataType GlobalData;
 void NGXMGR_SessionLog(const char *format, ...)
                              __attribute__((format(__printf__, 1, 2)));
 
+/* (Re)open the session log file (for config reload, lock safe for write) */
+void NGXMGR_ReopenSessionLog();
+
+/* Fiber-level access to the global connection pool */
+WXDBConnection *NGXMGR_ObtainDBConnection();
+void NGXMGR_ReturnDBConnection(WXDBConnection *conn);
+
 /*
  * Container element for an instance of a connection from the nginx module.
  */
@@ -84,19 +83,19 @@ typedef struct {
     /* Underlying network connection from module */
     WXSocket connectionHandle;
 
-    /* Request header and incoming request length, <= 0 for header read */
+    /* Request header and incoming request (body) length */
     uint8_t requestHeader[4];
     int32_t requestLength;
 
     /* Inbound and outbound buffering objects */
     WXBuffer request, response;
+
+    /* Set on unrecoverable (memory) errors, connection is dropped */
+    int closeRequested;
 } NGXModuleConnection;
 
 /* Management methods for the above, from requests.c */
-void NGXMGR_AllocateConnection(WXEvent_Registry *registry, WXSocket connHandle,
-                               const char *origin);
-void NGXMGR_ProcessEvent(NGXModuleConnection *conn, uint32_t events);
-void NGXMGR_UpdateEvents(NGXModuleConnection *conn, uint32_t events);
+void NGXMGR_AllocateConnection(WXSocket connHandle, const char *origin);
 void NGXMGR_DestroyConnection(NGXModuleConnection *conn);
 
 /* And the common response methods (for use by the profiles) */
@@ -143,6 +142,9 @@ struct NGXMGR_Profile {
 /* Exposed allocation method for creating profiles instances from config */
 NGXMGR_Profile *NGXMGR_AllocProfile(char *profileName, WXJSONValue *config);
 
+/* Reload-safe lookup of the named profile, NULL if not defined */
+NGXMGR_Profile *NGXMGR_GetProfile(const char *profileName);
+
 /* Structure for tracking security element lists, for processing and return */
 typedef struct WXMLLinkedElement {
     struct WXMLElement *elmnt;
@@ -156,7 +158,7 @@ int NGXMGR_ValidateSession(char *sessionId, char *sourceIpAddr,
                            int profileIPLocked, WXBuffer *attrs);
 
 /* Callback definition for asynchronous session completion */
-/* All data is internally managed, this method must not block (under lock) */
+/* All data is internally managed, this method must not yield (under lock) */
 typedef void NGXMGR_CompleteSessionHandler(NGXModuleConnection *conn,
                                            char *sessionId,
                                            WXBuffer *attributes,
