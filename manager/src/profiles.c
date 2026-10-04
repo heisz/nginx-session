@@ -42,12 +42,12 @@ static void uriDecode(uint8_t *src) {
     while (*src != '\0') {
         if ((*src == '%') &&
                 isxdigit(h = *(src + 1)) && isxdigit(l = *(src + 2))) {
-            if (h > 'a') h = h - 'a' + 10;
-            else if (h > 'A') h = h - 'A' + 10;
+            if (h >= 'a') h = h - 'a' + 10;
+            else if (h >= 'A') h = h - 'A' + 10;
             else h = h - '0';
 
-            if (l > 'a') l = l - 'a' + 10;
-            else if (l > 'A') l = l - 'A' + 10;
+            if (l >= 'a') l = l - 'a' + 10;
+            else if (l >= 'A') l = l - 'A' + 10;
             else l = l - '0';
 
             *(dst++) = (h << 4) | l;
@@ -86,8 +86,9 @@ static int parseFormEncoded(WXHashTable *table, char *data, int len) {
 
     /* Outer loop splits on the ampersand */
     while (len > 0) {
-        /* Find next separator, bounded by length */
+        /* Find next separator, bounded by (remaining) length */
         str = ptr;
+        l = len;
         while (l > 0) {
             if (*str == '&') break;
             str++; l--;
@@ -153,6 +154,8 @@ static int extAttrScanner(WXHashTable *table, void *key, void *obj,
     } else {
         WXLog_Error("Invalid externalAttributes entry, must be string:string");
     }
+
+    return 0;
 }
 
 /* Base method for (re)initializing common elements */
@@ -243,6 +246,7 @@ typedef struct {
     int clockSkew;
     int isExtAuthOnly;
     int debugReqResp;
+    int insecureNoSignature;
 
     /* Derived elements from configuration */
     X509 *idpCertificate;
@@ -253,6 +257,12 @@ typedef struct {
     WXHashTable reqSessions;
     WXThread_Mutex reqLock;
 } SAMLProfile;
+
+/* Pending/incomplete authentication requests timeout (seconds) */
+#define SAML_REQUEST_LIFESPAN 900
+
+/* Restrict destination length to avoid protocol overflow */
+#define SAML_MAX_DEST_URL 8192
 
 /**
  * Tracking structure for original SAML session request, for response
@@ -300,7 +310,9 @@ static WXJSONBindDefn samlBindings[] = {
     { "isExternalAuthOnly", WXJSONBIND_BOOLEAN,
       offsetof(SAMLProfile, isExtAuthOnly), FALSE },
     { "debugReqResp", WXJSONBIND_BOOLEAN,
-      offsetof(SAMLProfile, debugReqResp), FALSE }
+      offsetof(SAMLProfile, debugReqResp), FALSE },
+    { "insecureNoSignature", WXJSONBIND_BOOLEAN,
+      offsetof(SAMLProfile, insecureNoSignature), FALSE }
 };
 
 #define SAML_CFG_COUNT (sizeof(samlBindings) / sizeof(WXJSONBindDefn))
@@ -374,11 +386,90 @@ static void logXML(WXMLElement *root) {
     WXBuffer_Destroy(&buffer);
 }
 
+/*
+ * Create a safe/sanitized destination URL for use in the SSO negotiation.
+ * URI encodes as needed and ensures absolute paths.  Returns NULL (fallback
+ * to the default endpoint) for memfail or invalid content.
+ *
+ * NOTE: similar to, but not exactly same as version in toolkit
+ */
+static char *safeDestURL(char *uri) {
+    static char hex[] = "0123456789ABCDEF";
+    uint8_t ch, *src = (uint8_t *) uri;
+    char *retval, *dst;
+
+    /* Only allow standard absolute paths */
+    if ((*src != '/') || (src[1] == '/') || (src[1] == '\\')) return NULL;
+
+    /* Assume worst case of encoding all characters */
+    retval = (char *) WXMalloc(3 * strlen(uri) + 1);
+    if (retval == NULL) return NULL;
+
+    dst = retval;
+    while ((ch = *src) != '\0') {
+        /* Encode just illegal characters, assume proper inner encoding */
+        if ((ch <= 0x20) || (ch >= 0x7F) || (ch == '"') || (ch == '\\')) {
+            *(dst++) = '%';
+            *(dst++) = hex[(ch >> 4) & 0x0F];
+            *(dst++) = hex[ch & 0x0F];
+        } else {
+            *(dst++) = ch;
+        }
+        src++;
+    }
+    *dst = '\0';
+
+    if ((dst - retval) > SAML_MAX_DEST_URL) {
+        WXLog_Warn("Destination redirect length exceeded, using default");
+        WXFree(retval);
+        return NULL;
+    }
+
+    return retval;
+}
+
+/* Scanner to create list of outstanding session requests that have expired */
+static int expireScanCB(WXHashTable *table, void *key, void *obj,
+                        void *userData) {
+    SAMLReqSession *reqSession = (SAMLReqSession *) obj;
+    WXArray *expired = (WXArray *) userData;
+
+    if ((time((time_t *) NULL) - reqSession->start) > SAML_REQUEST_LIFESPAN) {
+        if (WXArray_Push(expired, &reqSession) == NULL) return 1;
+    }
+
+    return 0;
+}
+
+/* Discard expired pending requests, must be called under the request lock */
+static void expireReqSessions(SAMLProfile *profile) {
+    SAMLReqSession *reqSession;
+    WXArray expired;
+    int idx;
+
+    /* Generate the list of expired sessions using the scanner callback */
+    if (WXArray_Init(&expired, SAMLReqSession *, 16) == NULL) return;
+    (void) WXHash_Scan(&(profile->reqSessions), expireScanCB, &expired);
+
+    /* And purge them from the pending hash */
+    for (idx = 0; idx < expired.length; idx++) {
+        reqSession = ((SAMLReqSession **) expired.array)[idx];
+        (void) WXHash_RemoveEntry(&(profile->reqSessions),
+                                  reqSession->reqSessionId, NULL, NULL,
+                                  WXHash_StrHashFn, WXHash_StrEqualsFn);
+        if (reqSession->destURL != NULL) WXFree(reqSession->destURL);
+        WXFree(reqSession->reqSessionId);
+        WXFree(reqSession);
+    }
+    WXArray_Destroy(&expired);
+}
+
 /* Standard initialization method for a SAML profile */
 static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
                                 WXJSONValue *config) {
     SAMLProfile *retval = (SAMLProfile *) orig;
     char errMsg[1024];
+    X509 *cert;
     BIO *bio;
     size_t l;
     int idx;
@@ -405,6 +496,7 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
         retval->clockSkew = 0;
         retval->isExtAuthOnly = FALSE;
         retval->debugReqResp = FALSE;
+        retval->insecureNoSignature = FALSE;
 
         retval->attributes = NULL;
         retval->idpCertificate = NULL;
@@ -448,13 +540,12 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
             (void) WXHash_Scan(&(retval->attributes->value.oval),
                                samlAttrScanner, &(retval->attrMap));
         }
+
+        /* Reference into the config tree, released after load */
+        retval->attributes = NULL;
     }
 
-    /* Post-process the validation certificate, if provided */
-    if (retval->idpCertificate != NULL) {
-        X509_free(retval->idpCertificate);
-        retval->idpCertificate = NULL;
-    }
+    /* Post-process the validation certificate, if provided (on success) */
     if ((retval->encodedCert != NULL) &&
             ((l = strlen(retval->encodedCert)) != 0)) {
         bio = BIO_new(BIO_s_mem());
@@ -464,22 +555,38 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
             return NULL;
         }
 
-        retval->idpCertificate = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
         BIO_free_all(bio);
-        if (retval->idpCertificate == NULL) {
+        if (cert == NULL) {
             WXLog_Error("Failed to parse X509 PEM encoded certificate");
             return NULL;
         }
+        if (retval->idpCertificate != NULL) {
+            X509_free(retval->idpCertificate);
+        }
+        retval->idpCertificate = cert;
 
         WXLog_Debug("Loaded IdP Certificate for %s",
                     X509_NAME_oneline(X509_get_subject_name(
                                                retval->idpCertificate),
                                       errMsg, sizeof(errMsg)));
     } else {
-        WXLog_Warn("\n\nWARNING: No IdP validation certificate provided!!!!\n"
-          "This exposes your SAML SP to injection replay attacks, and should\n"
-          "ONLY be enabled under emergency conditions where the validation\n"
-          "code is failing unexpectedly (and maybe not even then).\n");
+        if (retval->idpCertificate != NULL) {
+            X509_free(retval->idpCertificate);
+            retval->idpCertificate = NULL;
+        }
+
+        if (retval->insecureNoSignature) {
+            WXLog_Warn("\n\nWARNING: No IdP validation certificate provided!\n"
+              "This exposes your SAML SP to injection replay attacks, and\n"
+              "should ONLY be enabled under emergency conditions where the\n"
+              "validation code is failing unexpectedly (and maybe not even\n"
+              "then).\n");
+        } else {
+            WXLog_Error("No IdP validation certificate provided for SAML "
+                        "profile '%s', all logins will be rejected.",
+                        retval->base.name);
+        }
     }
 
     return &(retval->base);
@@ -488,7 +595,7 @@ static NGXMGR_Profile *SAMLInit(NGXMGR_Profile *orig, const char *profileName,
 /* Verify processing method for the SAML profile, establish new session */
 static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                               char *sourceIpAddr, char *request) {
-    char *url, *enc, *sessReqId, xmlBuff[1024], *deflateBuff, tmBuff[64];
+    char *url, *enc, *sessReqId, tmBuff[64], xmlBuff[1024], *deflateBuff = NULL;
     SAMLProfile *profile = (SAMLProfile *) prf;
     WXMLNamespace *samlNs, *samlpNs, authNs;
     WXMLElement *authnReqElmnt = NULL;
@@ -513,18 +620,23 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         goto memfail;
     }
     reqSession->reqSessionId = sessReqId;
+    reqSession->destURL = NULL;
     reqSession->start = time((time_t *) NULL);
     if (strncmp(request, "GET ", 4) == 0) {
-        reqSession->destURL = (char *) WXMalloc(strlen(request) + 1);
-        if (reqSession->destURL == NULL) goto memfail;
-        (void) strcpy(reqSession->destURL, request + 4);
+        /* Rejection here also NULLs back to default index */
+        reqSession->destURL = safeDestURL(request + 4);
     } else {
-        /* Fall back to the conifigured default index */
+        /* Fall back to the configured default index */
     }
     (void) WXThread_MutexLock(&(profile->reqLock));
+    expireReqSessions(profile);
     if (!WXHash_PutEntry(&(profile->reqSessions), sessReqId, reqSession,
                          NULL, NULL, WXHash_StrHashFn, WXHash_StrEqualsFn)) {
         (void) WXThread_MutexUnlock(&(profile->reqLock));
+        if (reqSession->destURL != NULL) WXFree(reqSession->destURL);
+        WXFree(reqSession->reqSessionId);
+        WXFree(reqSession);
+        reqSession = NULL;
         goto memfail;
     }
     (void) WXThread_MutexUnlock(&(profile->reqLock));
@@ -627,6 +739,8 @@ static void SAMLProcessVerify(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         WXLog_Error("Zlib default failure: [%d] %s", zrc, zError(zrc));
         NGXMGR_IssueErrorResponse(conn, 500, "Internal Manager Error",
                            "Internal Error: failure in SAML redirect");
+        WXFree(deflateBuff);
+        WXBuffer_Destroy(&buffer);
         return;
     }
            
@@ -707,6 +821,42 @@ static time_t parseRTT(char *which, char *tmstr) {
            atoi(tmstr + 17);
 }
 
+/* Validate time limits (with skew) for the provided element */
+static int validateTimeWindow(WXMLElement *elmnt, char *which, int clockSkew,
+                              int expiryRequired) {
+    time_t tm, now = time((time_t *) NULL);
+    WXMLAttribute *attr;
+
+    attr = (WXMLAttribute *) WXML_Find(elmnt, "@NotOnOrAfter", FALSE);
+    if ((attr == NULL) || (attr->value == NULL)) {
+        if (expiryRequired) {
+            WXLog_Warn("Assertion %s missing NotOnOrAfter, skipping", which);
+            return FALSE;
+        }
+    } else {
+        tm = parseRTT("NotOnOrAfter", attr->value);
+        if (tm == 0) return FALSE;
+        if (tm <= (now - clockSkew)) {
+            WXLog_Warn("Assertion %s NotOnOrAfter in past (%d s), skipping",
+                       which, (int) (now - tm));
+            return FALSE;
+        }
+    }
+
+    attr = (WXMLAttribute *) WXML_Find(elmnt, "@NotBefore", FALSE);
+    if ((attr != NULL) && (attr->value != NULL)) {
+        tm = parseRTT("NotBefore", attr->value);
+        if (tm == 0) return FALSE;
+        if (tm > (now + clockSkew)) {
+            WXLog_Warn("Assertion %s NotBefore in future (%d s), skipping",
+                       which, (int) (tm - now));
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
 /* Asynchronous data carrier and method for database verification */
 typedef struct {
     NGXMGR_Profile *prf;
@@ -737,29 +887,25 @@ int extAttrFieldCB(WXHashTable *table, void *key, void *obj, void *userData) {
 static void samlLoginFinish(SAMLLoginInfo *info) {
     WXBuffer *cmdbuff = &(info->cmdbuff);
     WXDBConnection *dbconn = NULL;
+    WXDBStatement *stmt = NULL;
     WXDBResultSet *rs = NULL;
     int userId, idx;
-    char *uid, *val;
+    char *uid;
 
     /* Query to extract the userId and extended attributes */
+    uid = (char *) WXDict_GetEntry(&(info->attributes), "uid");
     if (WXBuffer_Init(cmdbuff, 1024) == NULL) goto memfail;
     if (WXArray_Init(&(info->extAttrKeys), char *, 16) == NULL) goto memfail;
     (void) WXBuffer_Append(cmdbuff, "SELECT user_id", 14, TRUE);
     if (WXHash_Scan(&(info->prf->extAttributes.base),
                     extAttrFieldCB, info) != 0) goto memfail;
+
+    /* Identity referenced via bound parameter */
     if (WXBuffer_Append(cmdbuff,
                         " FROM ngxsessionmgr.users"
-                        " WHERE active = 't' AND external_auth_id = '",
+                        " WHERE active = 't' AND external_auth_id = ?",
                         25 + 44, TRUE) == NULL) goto memfail;
-    uid = (char *) WXDict_GetEntry(&(info->attributes), "uid");
-    while (*uid != '\0') {
-        if (*uid == '\'') {
-            if (WXBuffer_Append(cmdbuff, "\\", 1, TRUE) == NULL) goto memfail;
-        }
-        if (WXBuffer_Append(cmdbuff, uid, 1, TRUE) == NULL) goto memfail;
-        uid++;
-    }
-    if (WXBuffer_Append(cmdbuff, "'\0", 2, TRUE) == NULL) goto memfail;
+    if (WXBuffer_Append(cmdbuff, "\0", 1, TRUE) == NULL) goto memfail;
 
     /* Issue query and validate/extract user information */
     dbconn = NGXMGR_ObtainDBConnection();
@@ -768,8 +914,10 @@ static void samlLoginFinish(SAMLLoginInfo *info) {
         goto verifyfail;
     }
 
-    rs = WXDBConnection_ExecuteQuery(dbconn, cmdbuff->buffer);
-    if (rs == NULL) {
+    stmt = WXDBConnection_Prepare(dbconn, (char *) cmdbuff->buffer);
+    if ((stmt == NULL) ||
+            (WXDBStatement_BindString(stmt, 0, uid) != WXDRC_OK) ||
+            ((rs = WXDBStatement_ExecuteQuery(stmt)) == NULL)) {
        WXLog_Error("Unexpected error validating user information: %s",
                     WXDB_GetLastErrorMessage(dbconn));
        goto verifyfail;
@@ -777,8 +925,10 @@ static void samlLoginFinish(SAMLLoginInfo *info) {
 
     /* Presumes exactly one row, read first only */
     if (!WXDBResultSet_NextRow(rs)) {
-        WXLog_Error("SAML authenticated identity '%s' but not defined/active",
-                    (char *) WXDict_GetEntry(&(info->attributes), "uid"));
+        WXLog_Error("SAML authenticated identity '%s' but not "
+                    "defined/active", uid);
+        NGXMGR_SessionLog("[%s] SAML login rejected for '%s': identity not "
+                          "defined/active", info->sourceIpAddr, uid);
         NGXMGR_IssueErrorResponse(info->conn, 403, "Invalid User",
                            "User externally validated but not defined/active");
         goto cleanup;
@@ -799,10 +949,15 @@ static void samlLoginFinish(SAMLLoginInfo *info) {
     /* Release before allocating, which needs a (capped) connection too */
     WXDBResultSet_Close(rs);
     rs = NULL;
+    WXDBStatement_Close(stmt);
+    stmt = NULL;
     NGXMGR_ReturnDBConnection(dbconn);
     dbconn = NULL;
 
-    /* And issue the session instance */
+    /* And issue the session instance (extended attributes may replace uid) */
+    uid = (char *) WXDict_GetEntry(&(info->attributes), "uid");
+    NGXMGR_SessionLog("[%s] SAML login accepted for '%s'",
+                      info->sourceIpAddr, uid);
     NGXMGR_AllocateNewSession(userId, info->sourceIpAddr, -1,
                               &(info->attributes),
                               (info->destURL != NULL) ? info->destURL :
@@ -811,6 +966,7 @@ static void samlLoginFinish(SAMLLoginInfo *info) {
 
 cleanup:
     if (rs != NULL) WXDBResultSet_Close(rs);
+    if (stmt != NULL) WXDBStatement_Close(stmt);
     if (dbconn != NULL) NGXMGR_ReturnDBConnection(dbconn);
     WXArray_Destroy(&(info->extAttrKeys));
     WXBuffer_Destroy(&(info->cmdbuff));
@@ -836,6 +992,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                       char *sourceIpAddr, char *data, int dataLen) {
     WXMLElement *root = NULL, *node, *chld, *prnt, *conf, *val, *attrs, *attv;
     char *ptr, *samlResp, *decSamlResp = NULL, errorMsg[1024], *nameId;
+    char *reason = "processing error", *respInResponseTo;
     WXMLLinkedElement *signedRefs = NULL, *sref;
     SAMLProfile *profile = (SAMLProfile *) prf;
     BIO *base64Dec, *base64Buff = NULL;
@@ -846,7 +1003,6 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     WXMLAttribute *attr;
     SAMLLoginInfo *info;
     const char *key;
-    time_t tm;
     int len;
 
     /* Decode the form arguments */
@@ -874,8 +1030,16 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     base64Buff = BIO_push(base64Dec, base64Buff);
     BIO_set_flags(base64Buff, BIO_FLAGS_BASE64_NO_NL);
     len = BIO_read(base64Buff, decSamlResp, len);
-    decSamlResp[len] = '\0';
     BIO_free_all(base64Buff); base64Buff = NULL;
+    if (len <= 0) {
+        WXLog_Error("Invalid base64 encoding of SAML response");
+        NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Response",
+                                  "Unable to decode content of SAML response");
+        WXFree(decSamlResp);
+        freeEncodedData(&postData);
+        return;
+    }
+    decSamlResp[len] = '\0';
 
     root = WXML_Decode(decSamlResp, TRUE, errorMsg, sizeof(errorMsg));
     WXFree(decSamlResp); decSamlResp = NULL;
@@ -890,15 +1054,44 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     /* Sometimes you just have to look closer */
     if (profile->debugReqResp) logXML(root);
 
-    /* First, determine the validated references up front (if enabled) */
+    /* Signature validation is mandatory unless explicitly waived */
     if (profile->idpCertificate != NULL) {
         signedRefs = WXML_ValidateSignedReferences(root,
-                                  X509_get_pubkey(profile->idpCertificate));
+                                  X509_get0_pubkey(profile->idpCertificate));
         if (signedRefs == NULL) {
             /* Either internal error or bad signatures, invalid response */
+            reason = "no valid signature";
             goto samlerr;
         }
+    } else if (!profile->insecureNoSignature) {
+        WXLog_Error("No IdP certificate for SAML profile, rejecting");
+        reason = "no IdP certificate configured";
+        goto samlerr;
     }
+
+    /* Response level validations (core 3.2.2, profiles 4.1.4.3) */
+    attr = (WXMLAttribute *) WXML_Find(root, "/Status/StatusCode/@Value",
+                                       FALSE);
+    if ((attr == NULL) || (attr->value == NULL) ||
+            (strcmp(attr->value,
+                    "urn:oasis:names:tc:SAML:2.0:status:Success") != 0)) {
+        WXLog_Warn("SAML response status is not success: %s",
+                   (((attr == NULL) || (attr->value == NULL)) ? "missing" :
+                                                                attr->value));
+        reason = "response status not success";
+        goto samlerr;
+    }
+    attr = (WXMLAttribute *) WXML_Find(root, "@Destination", FALSE);
+    if ((attr != NULL) && (attr->value != NULL) &&
+            (profile->assertionConsumerURL != NULL) &&
+            (strcmp(attr->value, profile->assertionConsumerURL) != 0)) {
+        WXLog_Warn("Response Destination mismatch ('%s' vs. '%s')",
+                   attr->value, profile->assertionConsumerURL);
+        reason = "response destination mismatch";
+        goto samlerr;
+    }
+    attr = (WXMLAttribute *) WXML_Find(root, "@InResponseTo", FALSE);
+    respInResponseTo = ((attr != NULL) ? attr->value : NULL);
 
     /* Prepare for session attribute collection */
     if (!WXDict_Init(&attributes, 16, FALSE)) goto memfail;
@@ -909,6 +1102,9 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         /* Just interested in assertions */
         if ((node->name == NULL) ||
                    (strcmp(node->name, "Assertion") != 0)) continue;
+
+        /* Each assertion is validated separately */
+        conf = NULL;
 
         /* If signature verification enabled, assertion must be signed */
         if (signedRefs != NULL) {
@@ -932,14 +1128,17 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         /* Per XSD, Assertion must contain Issuer response to entity */
         if ((chld = WXML_Find(node, "/Issuer", FALSE)) == NULL) {
             WXLog_Error("Assertion missing Issuer child element");
+            reason = "assertion missing issuer";
             goto samlerr;
         }
-        attr = WXML_Find(node, "@Format", FALSE);
+        attr = WXML_Find(chld, "@Format", FALSE);
         if (attr != NULL) {
             if ((attr->value == NULL) ||
                 (strcmp(attr->value,
                     "urn:oasis:names:tc:SAML:2.0:nameid-format:entity") != 0)) {
-                WXLog_Error("Incorrect Issuer Format '%s'", attr->value);
+                WXLog_Error("Incorrect Issuer Format '%s'",
+                            ((attr->value == NULL) ? "" : attr->value));
+                reason = "incorrect issuer format";
                 goto samlerr;
             }
         }
@@ -980,47 +1179,23 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                 }
             }
         }
-        if ((conf != NULL) &&
-                (((attr = WXML_Find(conf, "/@NotOnOrAfter", FALSE)) == NULL) ||
-                     (attr->value == NULL))) {
-            WXLog_Warn("Assertion Subject missing NotOnOrAfter, skipping");
-            conf = NULL;
-        } else {
-            tm = parseRTT("NotOnOrAfter", attr->value);
-            if (tm == 0) {
-                conf = NULL;
-            } else if (tm < (time((time_t *) NULL) - profile->clockSkew)) {
-                WXLog_Warn("Assertion NotOnOrAfter in past (%d s), skipping",
-                           (int) (time((time_t *) NULL) - tm));
-                conf = NULL;
-            }
-        }
-        if ((conf != NULL) &&
-                (((attr = WXML_Find(conf, "/@InResponseTo", FALSE)) == NULL) ||
-                     (attr->value == NULL))) {
-            WXLog_Warn("Assertion Subject missing InResponseTo, skipping");
-            conf = NULL;
-        } else {
-            (void) WXThread_MutexLock(&(profile->reqLock));
-            reqSession = WXHash_GetEntry(&(profile->reqSessions), attr->value,
-                                         WXHash_StrHashFn, WXHash_StrEqualsFn);
-            if (reqSession != NULL) {
-                (void) WXHash_RemoveEntry(&(profile->reqSessions), attr->value,
-                                          NULL, NULL, WXHash_StrHashFn,
-                                          WXHash_StrEqualsFn);
-            }
-            (void) WXThread_MutexUnlock(&(profile->reqLock));
 
-            if (reqSession == NULL) {
-                WXLog_Warn("Unsolicited or replay Assertion, skipping");
-                conf = NULL;
-            } else {
-                /* Steal the destination for use in the redirect */
-                destURL = reqSession->destURL;  reqSession->destURL = NULL;
-                WXFree(reqSession->reqSessionId);
-                WXFree(reqSession);
-            }
+        /* Bearer confirmation requires time validation */
+        if ((conf != NULL) &&
+                (!validateTimeWindow(conf, "SubjectConfirmationData",
+                                     profile->clockSkew, TRUE))) {
+            conf = NULL;
         }
+
+        /* As do Conditions if present */
+        if ((conf != NULL) &&
+                ((chld = WXML_Find(node, "/Conditions", FALSE)) != NULL) &&
+                (!validateTimeWindow(chld, "Conditions",
+                                     profile->clockSkew, FALSE))) {
+            conf = NULL;
+        }
+
+        /* Validate Audience response, if provided */
         if ((conf != NULL) &&
                 (((val = WXML_Find(node,
                                    "/Conditions/AudienceRestriction/Audience",
@@ -1036,21 +1211,58 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
                 conf = NULL;
             }
         }
-        /* Other Conditions do not have to be honoured, for now we don't */
 
-        /* If we've passed the validations, extract the nameid */
-        /* Poorly behaving IdP could mess with multiples, oh well */
-        if ((conf != NULL) &&
-                ((val = WXML_Find(conf->parent->parent,
-                                  "/NameID", FALSE)) != NULL) &&
-                (val->content != NULL)) {
-            nameId = val->content;
-            WXLog_Debug("Validated principal assertion for '%s'", nameId);
-
-            /* TODO - grab the optional elements as well */
-            /* AuthnStatement/@SessionIndex */
-            /* AuthnStatement/@SessionNotOnOrAfter */
+        /* Must have a subject NameID for logging */
+        val = NULL;
+        if (conf != NULL) {
+            val = WXML_Find(conf->parent->parent, "/NameID", FALSE);
+            if ((val == NULL) || (val->content == NULL)) {
+                WXLog_Warn("Assertion Subject missing NameID, skipping");
+                conf = NULL;
+            }
         }
+
+        /* Finally, verify InResponseTo to avoid replay attacks */
+        if ((conf != NULL) &&
+                (((attr = WXML_Find(conf, "/@InResponseTo", FALSE)) == NULL) ||
+                     (attr->value == NULL))) {
+            WXLog_Warn("Assertion Subject missing InResponseTo, skipping");
+            conf = NULL;
+        } else if ((conf != NULL) && (respInResponseTo != NULL) &&
+                       (strcmp(respInResponseTo, attr->value) != 0)) {
+            WXLog_Warn("Assertion/Response InResponseTo mismatch, skipping");
+            conf = NULL;
+        } else if (conf != NULL) {
+            (void) WXThread_MutexLock(&(profile->reqLock));
+            reqSession = WXHash_GetEntry(&(profile->reqSessions), attr->value,
+                                         WXHash_StrHashFn, WXHash_StrEqualsFn);
+            if (reqSession != NULL) {
+                (void) WXHash_RemoveEntry(&(profile->reqSessions), attr->value,
+                                          NULL, NULL, WXHash_StrHashFn,
+                                          WXHash_StrEqualsFn);
+            }
+            (void) WXThread_MutexUnlock(&(profile->reqLock));
+
+            if (reqSession == NULL) {
+                WXLog_Warn("Unsolicited or replay Assertion, skipping");
+                conf = NULL;
+            } else {
+                /* Steal the destination for use in the redirect */
+                if (destURL != NULL) WXFree(destURL);
+                destURL = reqSession->destURL;  reqSession->destURL = NULL;
+                WXFree(reqSession->reqSessionId);
+                WXFree(reqSession);
+            }
+        }
+
+        /* If we still have a subject verification reference, it's valid */
+        if (conf == NULL) continue;
+        nameId = val->content;
+        WXLog_Debug("Validated principal assertion for '%s'", nameId);
+
+        /* TODO - grab the optional elements as well */
+        /* AuthnStatement/@SessionIndex */
+        /* AuthnStatement/@SessionNotOnOrAfter */
 
         /* Regardless of identity conditions, attributes can be distributed */
         if ((attrs = WXML_Find(node, "/AttributeStatement", FALSE)) != NULL) {
@@ -1077,6 +1289,8 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     /* Final test, one of the Assertions must have validated user identity */
     if (nameId == NULL) {
         WXLog_Error("Invalid SAML response, no asserted user identity");
+        NGXMGR_SessionLog("[%s] SAML login rejected: no validated assertion",
+                          sourceIpAddr);
         NGXMGR_IssueErrorResponse(conn, 400, "Improper SAML Response",
                                   "One or more signature/validation errors in "
                                   "SAML response, unable to validate user "
@@ -1092,10 +1306,16 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
         /* DB dependent, immediately assign session or validate uid */
         /* TODO - handle externally specified expiry time */
         if ((GlobalData.dbConnPool == NULL) || (profile->isExtAuthOnly)) {
+            NGXMGR_SessionLog("[%s] SAML login accepted for '%s'",
+                              sourceIpAddr, nameId);
             NGXMGR_AllocateNewSession(-1, sourceIpAddr, -1, &attributes,
                                       (destURL != NULL) ? destURL :
                                                           prf->defaultIndex,
                                       conn, StdSessionEstablishHandler);
+        } else if (strlen(sourceIpAddr) >= sizeof(info->sourceIpAddr)) {
+            WXLog_Error("Invalid source address for SAML login completion");
+            NGXMGR_IssueErrorResponse(conn, 400, "Invalid Request",
+                                      "Invalid source address in request");
         } else {
             /* Could fold together but keep alignment with old event model */
             info = (SAMLLoginInfo *) WXCalloc(sizeof(SAMLLoginInfo));
@@ -1124,6 +1344,7 @@ static void SAMLLogin(NGXMGR_Profile *prf, NGXModuleConnection *conn,
     return;
 
 samlerr:
+    NGXMGR_SessionLog("[%s] SAML login rejected: %s", sourceIpAddr, reason);
     if (destURL != NULL) WXFree(destURL);
     if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
     if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
@@ -1137,6 +1358,7 @@ memfail:
     WXLog_Error("Memory allocation failure in SAML response processing");
     if (destURL != NULL) WXFree(destURL);
     if (attributes.base.entries != NULL) WXDict_Destroy(&attributes);
+    if (signedRefs != NULL) WXML_FreeLinkedElements(signedRefs);
     if (postData.entries != NULL) freeEncodedData(&postData);
     if (base64Buff != NULL) BIO_free_all(base64Buff);
     if (decSamlResp != NULL) WXFree(decSamlResp);
@@ -1148,10 +1370,14 @@ memfail:
 static void SAMLProcessAction(NGXMGR_Profile *prof, NGXModuleConnection *conn,
                               char *sourceIpAddr, char *request, char *action,
                               char *sessionId, char *data, int dataLen) {
-    if ((strcmp(action, "login") == 0) && (strncmp(request, "PST", 3) == 0)) {
+    if ((action != NULL) && (strcmp(action, "login") == 0) &&
+            (strncmp(request, "PST", 3) == 0)) {
         SAMLLogin(prof, conn, sourceIpAddr, data, dataLen);
     } else {
-        WXLog_Error("Unrecognized action/request: %s - %s", action, request);
+        /* Log without query paramaters (tokens) */
+        WXLog_Error("Unrecognized action/request: %s - %.*s",
+                    ((action != NULL) ? action : "(none)"),
+                    (int) strcspn(request, "?"), request);
         NGXMGR_IssueErrorResponse(conn, 400, "Invalid SAML Configuration",
                           "Invalid SAML configuration and/or response");
     }
