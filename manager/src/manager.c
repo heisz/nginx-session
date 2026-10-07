@@ -319,7 +319,7 @@ static void acceptHandler(void *arg) {
     WXLog_Info("Accepting connections, max request size %lld bytes",
                (long long int) GlobalData.maxRequestSize);
     while (TRUE) {
-        /* Wait for incoming connection (readability on the connect 
+        /* Wait for incoming connection (readability on the connect */
         if (GMPS_YieldSocket(svcConnectHandle, GMPS_EVT_IN) == 0) {
             WXLog_Error("Error in wait on bind socket: %s",
                         WXSocket_GetErrorStr(WXSocket_GetLastErrNo()));
